@@ -1,0 +1,26 @@
+# Build outputs
+build/
+crates/proton-drive-daemon/target/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+CTestTestfile.cmake
+Testing/
+install_manifest*.txt
+
+# Local indexing & MCP tooling
+.codebase-memory/
+mcp_server.log
+
+# Local third-party reference artifacts (do not commit)
+*.dmg
+ProtonDrive-3.0.3.dmg
+extracted/
+mac-drive-source/
+
+# Editor & OS files
+*.swp
+*~
+.DS_Store

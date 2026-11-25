@@ -1,0 +1,37 @@
+# Maintainer: Neutron Drive Contributors
+pkgname=neutron-drive
+pkgver=3.0.3
+pkgrel=1
+pkgdesc="Unofficial third-party Linux desktop client and FUSE virtual filesystem for Proton Drive"
+arch=('x86_64' 'aarch64')
+url="https://github.com/CheckForUpdates/neutron-drive"
+license=('GPL-3.0-or-later')
+depends=('qt6-base' 'fuse3')
+makedepends=('cmake' 'cargo' 'rust')
+source=("${pkgname}-${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+    cargo fetch --locked --manifest-path crates/proton-drive-daemon/Cargo.toml
+}
+
+build() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+    cmake -S . -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DBUILD_TESTS=ON
+    cmake --build build -j"$(nproc)"
+}
+
+check() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+    QT_QPA_PLATFORM=offscreen ctest --test-dir build --output-on-failure
+}
+
+package() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+    DESTDIR="${pkgdir}" cmake --install build
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

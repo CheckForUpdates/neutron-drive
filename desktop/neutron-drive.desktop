@@ -1,0 +1,12 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Name=Neutron Drive
+GenericName=Cloud Storage (Unofficial Proton Drive Client)
+Comment=Unofficial third-party end-to-end encrypted cloud storage client for Proton Drive
+Exec=neutron-drive gui
+Icon=neutron-drive
+Terminal=false
+Type=Application
+Categories=Network;FileTransfer;Utility;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

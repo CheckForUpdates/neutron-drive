@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Launcher script for Neutron Drive (unofficial Linux client for Proton Drive)
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+find_gui_binary() {
+    # 1. Directory of the launcher script
+    if [ -x "$SCRIPT_DIR/neutron-drive-gui" ]; then
+        echo "$SCRIPT_DIR/neutron-drive-gui"
+        return 0
+    fi
+
+    # 2. PATH
+    if command -v neutron-drive-gui >/dev/null 2>&1; then
+        local p
+        p="$(command -v neutron-drive-gui)"
+        if [ -x "$p" ]; then
+            echo "$p"
+            return 0
+        fi
+    fi
+
+    # 3. Standard prefixes
+    for prefix in "$HOME/.local/bin" "/usr/local/bin" "/usr/bin"; do
+        if [ -x "$prefix/neutron-drive-gui" ]; then
+            echo "$prefix/neutron-drive-gui"
+            return 0
+        fi
+    done
+
+    # 4. Repo build tree if running uninstalled
+    if [ -x "$SCRIPT_DIR/../build/neutron-drive-gui" ]; then
+        echo "$SCRIPT_DIR/../build/neutron-drive-gui"
+        return 0
+    elif [ -x "$PROJECT_ROOT/build/neutron-drive-gui" ]; then
+        echo "$PROJECT_ROOT/build/neutron-drive-gui"
+        return 0
+    fi
+
+    return 1
+}
+
+find_daemon_binary() {
+    # 1. Directory of the launcher script
+    if [ -x "$SCRIPT_DIR/neutron-drive-daemon" ]; then
+        echo "$SCRIPT_DIR/neutron-drive-daemon"
+        return 0
+    fi
+
+    # 2. PATH
+    if command -v neutron-drive-daemon >/dev/null 2>&1; then
+        local p
+        p="$(command -v neutron-drive-daemon)"
+        if [ -x "$p" ]; then
+            echo "$p"
+            return 0
+        fi
+    fi
+
+    # 3. Standard prefixes
+    for prefix in "$HOME/.local/bin" "/usr/local/bin" "/usr/bin"; do
+        if [ -x "$prefix/neutron-drive-daemon" ]; then
+            echo "$prefix/neutron-drive-daemon"
+            return 0
+        fi
+    done
+
+    # 4. Repo build tree if running uninstalled
+    if [ -x "$SCRIPT_DIR/../crates/proton-drive-daemon/target/release/neutron-drive-daemon" ]; then
+        echo "$SCRIPT_DIR/../crates/proton-drive-daemon/target/release/neutron-drive-daemon"
+        return 0
+    elif [ -x "$SCRIPT_DIR/../crates/proton-drive-daemon/target/debug/neutron-drive-daemon" ]; then
+        echo "$SCRIPT_DIR/../crates/proton-drive-daemon/target/debug/neutron-drive-daemon"
+        return 0
+    elif [ -x "$PROJECT_ROOT/crates/proton-drive-daemon/target/release/neutron-drive-daemon" ]; then
+        echo "$PROJECT_ROOT/crates/proton-drive-daemon/target/release/neutron-drive-daemon"
+        return 0
+    elif [ -x "$PROJECT_ROOT/crates/proton-drive-daemon/target/debug/neutron-drive-daemon" ]; then
+        echo "$PROJECT_ROOT/crates/proton-drive-daemon/target/debug/neutron-drive-daemon"
+        return 0
+    fi
+
+    return 1
+}
+
+# Update workflow: full repo update when run from source checkout
+if [ "$1" = "update" ]; then
+    if [ -x "$PROJECT_ROOT/install.sh" ]; then
+        exec "$PROJECT_ROOT/install.sh" --update "${@:2}"
+    else
+        echo "Error: Source installer install.sh not found. Re-run ./install.sh --update from the repository checkout." >&2
+        exit 1
+    fi
+fi
+
+# Native C++ GUI handler
+if [ "$1" = "gui" ]; then
+    if [ "${NEUTRON_DRIVE_NO_AUTOSTART_DAEMON:-${PROTON_DRIVE_NO_AUTOSTART_DAEMON:-0}}" != "1" ]; then
+        DAEMON_BIN="$(find_daemon_binary || true)"
+        if [ -n "$DAEMON_BIN" ] && [ -x "$DAEMON_BIN" ]; then
+            "$DAEMON_BIN" start >/dev/null 2>&1 || true
+        fi
+    fi
+
+    GUI_BIN="$(find_gui_binary || true)"
+    if [ -n "$GUI_BIN" ] && [ -x "$GUI_BIN" ]; then
+        exec "$GUI_BIN" "${@:2}"
+    else
+        echo "Error: neutron-drive-gui executable not found. Please install or build the native GUI package." >&2
+        exit 1
+    fi
+fi
+
+# Native Rust daemon & CLI handler
+DAEMON_BIN="$(find_daemon_binary || true)"
+if [ -n "$DAEMON_BIN" ] && [ -x "$DAEMON_BIN" ]; then
+    exec "$DAEMON_BIN" "$@"
+else
+    echo "Error: neutron-drive-daemon executable not found. Please install or build the native daemon package." >&2
+    exit 1
+fi

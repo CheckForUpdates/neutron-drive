@@ -1,0 +1,87 @@
+name: Release Verification Gates
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  QT_QPA_PLATFORM: offscreen
+
+jobs:
+  rust-and-qt-gates:
+    name: Rust Lint, Tests & CTest (Ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            qt6-base-dev \
+            qt6-base-dev-tools \
+            fuse3 \
+            libfuse3-dev \
+            rpm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/proton-drive-daemon/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('crates/proton-drive-daemon/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Rust formatting check
+        run: cargo fmt --manifest-path crates/proton-drive-daemon/Cargo.toml --all -- --check
+
+      - name: Rust strict Clippy lint
+        run: cargo clippy --manifest-path crates/proton-drive-daemon/Cargo.toml --all-targets --all-features -- -D warnings
+
+      - name: Rust unit and integration tests
+        run: cargo test --manifest-path crates/proton-drive-daemon/Cargo.toml --all-targets
+
+      - name: Configure and build CMake native targets
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
+          cmake --build build -j"$(nproc)"
+
+      - name: Run headless CTest suite
+        run: QT_QPA_PLATFORM=offscreen ctest --test-dir build --output-on-failure
+
+      - name: Verify staged install.sh layout
+        run: |
+          DESTDIR=/tmp/neutron-drive-stage ./install.sh --prefix /usr
+          test -x /tmp/neutron-drive-stage/usr/bin/neutron-drive-daemon
+          test -x /tmp/neutron-drive-stage/usr/bin/neutron-drive-gui
+          test -x /tmp/neutron-drive-stage/usr/bin/neutron-drive
+          test -f /tmp/neutron-drive-stage/usr/share/applications/neutron-drive.desktop
+          test -f /tmp/neutron-drive-stage/usr/share/systemd/user/neutron-drive.service
+
+      - name: Build distribution packages (.deb, .rpm, .tar.gz)
+        run: |
+          cpack --config build/CPackConfig.cmake -G DEB -B build/packages
+          cpack --config build/CPackConfig.cmake -G RPM -B build/packages
+          cpack --config build/CPackConfig.cmake -G TGZ -B build/packages
+          ls -lh build/packages/
+
+      - name: Upload built packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: build/packages/*
