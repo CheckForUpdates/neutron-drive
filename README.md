@@ -149,6 +149,22 @@ cargo test --manifest-path crates/proton-drive-daemon/Cargo.toml --all-targets
 
 ---
 
+## Codex on GitHub
+
+Add an OpenAI API key as the repository Actions secret `OPENAI_API_KEY`
+under **Settings → Secrets and variables → Actions**. Once the workflow is on
+the default branch, maintainers with write access can use it from GitHub.
+
+| Where | Trigger | Result |
+| --- | --- | --- |
+| Issue | Comment `/codex triage` | Triage notes and a proposed next step on the issue |
+| Pull request | Comment `/codex review` | Review findings in a PR conversation comment |
+| GitHub Actions | A failed **Release Verification Gates** push run on the default branch | Diagnosis in the **Codex GitHub Assistant** run summary |
+| GitHub Actions | Run **Codex GitHub Assistant** from the default branch and provide a failed **Release Verification Gates** run ID | Diagnosis for the selected run, including PR CI runs |
+
+Codex reads selected issue text, PR patches, or failed-step logs through the
+OpenAI API. It reports findings with read-only access to repository contents.
+
 ## Installation & Packaging
 
 ### Automated Installation Script
