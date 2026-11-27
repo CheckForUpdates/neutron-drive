@@ -24,6 +24,7 @@ private slots:
     void testEnsureDaemonRunningStartsProcessWhenOffline();
     void testTrayNotificationsForSyncErrorsAndAuthExpiration();
     void testPreferencesErrorRecoveryRetryAndClear();
+    void testResolveConflictAsync();
 };
 
 void TestIpcAsync::testDelayedDaemonDoesNotBlockEventLoop() {
@@ -634,6 +635,82 @@ void TestIpcAsync::testPreferencesErrorRecoveryRetryAndClear() {
     QTRY_VERIFY_WITH_TIMEOUT(prefs.syncSummaryText().contains("Errors: 0"), 2000);
     QVERIFY(!prefs.retryErrorsButton()->isEnabled());
     QVERIFY(!prefs.clearErrorsButton()->isEnabled());
+    QVERIFY(!prefs.resolveErrorsButton()->isEnabled());
+}
+
+void TestIpcAsync::testResolveConflictAsync() {
+    QTemporaryDir tempDir;
+    QVERIFY(tempDir.isValid());
+    QString socketPath = tempDir.filePath("resolve_conflict.sock");
+
+    int errorCount = 1;
+    QString lastResolvedPath;
+    QString lastResolvedStrategy;
+
+    QLocalServer server;
+    QVERIFY(server.listen(socketPath));
+
+    connect(&server, &QLocalServer::newConnection, [&]() {
+        while (QLocalSocket *sock = server.nextPendingConnection()) {
+            connect(sock, &QLocalSocket::readyRead, [&, sock]() {
+                QByteArray reqBytes = sock->readAll();
+                QJsonObject reqObj = QJsonDocument::fromJson(reqBytes).object();
+                QString cmd = reqObj.value("command").toString();
+
+                QJsonObject resp;
+                if (cmd == "get-config") {
+                    resp["status"] = "ok";
+                    QJsonObject cfg;
+                    cfg["mount_point"] = "/tmp/mount";
+                    resp["config"] = cfg;
+                } else if (cmd == "status") {
+                    resp["status"] = "ok";
+                    resp["authenticated"] = true;
+                    resp["sync_status"] = errorCount > 0 ? "error" : "idle";
+                    resp["error_count"] = errorCount;
+                    if (errorCount > 0) {
+                        resp["last_error"] = "/conflict.txt: upload conflict";
+                    }
+                } else if (cmd == "resolve-conflict") {
+                    QJsonObject args = reqObj.value("args").toObject();
+                    lastResolvedPath = args.value("path").toString();
+                    lastResolvedStrategy = args.value("strategy").toString();
+                    errorCount = 0;
+                    resp["status"] = "ok";
+                    resp["message"] = "Saved local copy as '/conflict (conflict).txt'";
+                } else {
+                    resp["status"] = "ok";
+                }
+
+                sock->write(QJsonDocument(resp).toJson(QJsonDocument::Compact) + "\n");
+                sock->flush();
+                sock->disconnectFromServer();
+            });
+            connect(sock, &QLocalSocket::disconnected, sock, &QObject::deleteLater);
+        }
+    });
+
+    IpcClient client(socketPath);
+    PreferencesDialog prefs(&client);
+    QTRY_VERIFY_WITH_TIMEOUT(prefs.resolveErrorsButton()->isEnabled(), 2000);
+
+    bool signalFired = false;
+    bool signalOk = false;
+    QString signalMsg;
+    connect(&prefs, &PreferencesDialog::conflictResolved,
+            [&](bool ok, const QString &, const QString &, const QString &msg) {
+                signalFired = true;
+                signalOk = ok;
+                signalMsg = msg;
+            });
+
+    prefs.resolveConflict("/conflict.txt", "keep-both", false);
+    QTRY_VERIFY_WITH_TIMEOUT(signalFired, 2000);
+    QVERIFY(signalOk);
+    QCOMPARE(lastResolvedPath, QString("/conflict.txt"));
+    QCOMPARE(lastResolvedStrategy, QString("keep-both"));
+    QVERIFY(signalMsg.contains("conflict"));
+    QTRY_VERIFY_WITH_TIMEOUT(!prefs.resolveErrorsButton()->isEnabled(), 2000);
 }
 
 int main(int argc, char *argv[]) {

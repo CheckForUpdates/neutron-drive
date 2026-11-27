@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Service
+MimeType=all/all;
+Actions=pinOffline;unpinOffline;
+X-KDE-Priority=TopLevel
+X-KDE-Submenu=Neutron Drive
+
+[Desktop Action pinOffline]
+Name=Pin for Offline Access
+Icon=neutron-drive
+Exec=neutron-drive pin %f
+
+[Desktop Action unpinOffline]
+Name=Unpin Offline Copy
+Icon=neutron-drive
+Exec=neutron-drive unpin %f

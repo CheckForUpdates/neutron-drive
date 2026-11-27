@@ -1,0 +1,66 @@
+name: Bug Report
+description: Report a crash, FUSE mount issue, sync failure, or Qt6 tray bug in Neutron Drive.
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting an issue with **Neutron Drive** (unofficial third-party Linux client for Proton Drive).
+        **Never paste session tokens, passwords, 2FA secrets, or private file contents.**
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the bug clearly, including expected vs. actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps to trigger the issue.
+      placeholder: |
+        1. Run `neutron-drive start`
+        2. Mount `~/NeutronDrive`
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Neutron Drive version / install method
+      description: e.g. `3.0.3`, `.deb`, `.rpm`, `install.sh`, or source build.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Linux distribution & desktop environment
+      description: e.g. Ubuntu 24.04 / GNOME (Wayland), Fedora 41 / KDE Plasma (Wayland), Arch / Sway.
+    validations:
+      required: true
+  - type: input
+    id: fuse
+    attributes:
+      label: FUSE version (`fusermount3 --version` or `fusermount --version`)
+      placeholder: "fusermount3 version: 3.16.2"
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of `neutron-drive status --json` (optional)
+      description: Redact any personal mount paths or account identifiers if needed.
+      render: json
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant daemon or GUI logs (optional)
+      description: Ensure no credentials, tokens, or private filenames are included.
+      render: text
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Pre-submission checks
+      options:
+        - label: I have redacted any credentials, tokens, and private file data.
+          required: true

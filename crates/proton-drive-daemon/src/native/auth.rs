@@ -1127,9 +1127,12 @@ struct AddressesResponse {
 
 const DEFAULT_ACCOUNT_WEB_URL: &str = "https://account.proton.me";
 // Browser SSO session forking (`/desktop/login?app=drive&pv=3`) requires a
-// server-recognized child client ID registered on account.proton.me. Keep
-// `cli-drive` until live SSO verification confirms an alternate external ID.
+// server-registered `ChildClientID` on `account.proton.me` (`cli-drive`), and
+// `/auth/v4/sessions/forks/{selector}` binds pulls to the matching
+// `x-pm-appversion` client ID prefix. Keep `DEFAULT_APP_VERSION` on all other
+// API requests.
 const FORK_CHILD_CLIENT_ID: &str = "cli-drive";
+const FORK_APP_VERSION: &str = "cli-drive@0.9.0";
 const FORK_AAD: &[u8] = b"fork";
 
 #[derive(Debug, Deserialize)]
@@ -2835,7 +2838,13 @@ impl AuthManager {
     ) -> Result<BrowserLoginChallenge, String> {
         let resp: ForkInitResponse = self
             .http
-            .get_json(RateLimitFamily::Auth, "/auth/v4/sessions/forks", &[], false)
+            .get_json_with_headers(
+                RateLimitFamily::Auth,
+                "/auth/v4/sessions/forks",
+                &[],
+                &[("x-pm-appversion", FORK_APP_VERSION)],
+                false,
+            )
             .map_err(|e| format!("Failed initiating browser SSO session fork: {}", e))?;
         if resp.code != 1000 && resp.code != 1001 {
             return Err(format!(
@@ -2863,6 +2872,13 @@ impl AuthManager {
             base, encoded_payload
         );
 
+        log::debug!(
+            "Initiated browser SSO fork (selector_len={}, has_slash={}, has_plus={})",
+            resp.selector.len(),
+            resp.selector.contains('/'),
+            resp.selector.contains('+')
+        );
+
         Ok(BrowserLoginChallenge {
             selector: resp.selector,
             user_code: resp.user_code,
@@ -2875,15 +2891,32 @@ impl AuthManager {
         &self,
         challenge: &BrowserLoginChallenge,
     ) -> Result<Option<String>, String> {
-        let path = format!("/auth/v4/sessions/forks/{}", challenge.selector);
-        let fork_resp: ForkPollResponse =
-            match self.http.get_json(RateLimitFamily::Auth, &path, &[], false) {
-                Ok(r) => r,
-                Err(HttpError::Status {
-                    status: 404 | 422, ..
-                }) => return Ok(None),
-                Err(e) => return Err(format!("Failed polling browser SSO session fork: {}", e)),
-            };
+        let encoded_selector: String =
+            url::form_urlencoded::byte_serialize(challenge.selector.as_bytes()).collect();
+        let path = format!("/auth/v4/sessions/forks/{}", encoded_selector);
+        let fork_resp: ForkPollResponse = match self.http.get_json_with_headers(
+            RateLimitFamily::Auth,
+            &path,
+            &[],
+            &[("x-pm-appversion", FORK_APP_VERSION)],
+            false,
+        ) {
+            Ok(r) => r,
+            Err(HttpError::Status {
+                status: status @ (404 | 422),
+                code,
+                message,
+            }) => {
+                log::debug!(
+                    "Browser SSO fork poll pending (HTTP {}, code={:?}): {}",
+                    status,
+                    code,
+                    message
+                );
+                return Ok(None);
+            }
+            Err(e) => return Err(format!("Failed polling browser SSO session fork: {}", e)),
+        };
 
         if let Some(code) = fork_resp.code {
             if code != 1000 && code != 1001 {

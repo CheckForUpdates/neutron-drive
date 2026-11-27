@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -22,6 +22,37 @@ static SHUTDOWN_SIGNAL_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
     SHUTDOWN_SIGNAL_RECEIVED.store(true, Ordering::SeqCst);
+}
+
+fn normalize_pin_virtual_path(raw: &str, mount_point: &Path) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Missing or empty path".to_string());
+    }
+    let mount_str = mount_point.to_string_lossy();
+    let mount_trimmed = mount_str.trim_end_matches('/');
+    let stripped = if !mount_trimmed.is_empty()
+        && (trimmed == mount_trimmed || trimmed.starts_with(&format!("{}/", mount_trimmed)))
+    {
+        &trimmed[mount_trimmed.len()..]
+    } else {
+        trimmed
+    };
+
+    let with_slash = if stripped.is_empty() || stripped == "/" {
+        "/".to_string()
+    } else if stripped.starts_with('/') {
+        stripped.trim_end_matches('/').to_string()
+    } else {
+        format!("/{}", stripped.trim_end_matches('/'))
+    };
+
+    for seg in with_slash.split('/').filter(|s| !s.is_empty()) {
+        if seg == "." || seg == ".." {
+            return Err("Invalid path: traversal segments are not allowed".to_string());
+        }
+    }
+    Ok(with_slash)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -219,6 +250,7 @@ impl ProtonDriveDaemon {
             let is_mounted = mount_session_c.lock().unwrap().is_some();
             let mp = mount_point_c.lock().unwrap().to_string_lossy().to_string();
             let (pending_uploads, error_count) = db_c.get_sync_counts();
+            let pinned_count = db_c.list_pinned_paths().len();
             let last_error = db_c
                 .get_recent_errors(1)
                 .into_iter()
@@ -235,6 +267,7 @@ impl ProtonDriveDaemon {
                 "offline_mode": sync_engine_c.is_offline_mode(),
                 "pending_uploads": pending_uploads,
                 "error_count": error_count,
+                "pinned_count": pinned_count,
                 "last_error": last_error,
                 "is_mounted": is_mounted,
                 "mount_point": mp,
@@ -476,6 +509,207 @@ impl ProtonDriveDaemon {
                     "status": "error",
                     "message": e,
                 }),
+            });
+
+        // pin
+        let db_c = db.clone();
+        let mount_point_c = Arc::clone(&mount_point);
+        let active_fuse_c = Arc::clone(&active_fuse);
+        self.ipc_server.register_handler("pin", move |args| {
+            let Some(raw_path) = args.get("path").and_then(|v| v.as_str()) else {
+                return serde_json::json!({
+                    "status": "error",
+                    "message": "Missing 'path' argument",
+                });
+            };
+            let mp = mount_point_c.lock().unwrap().clone();
+            let vpath = match normalize_pin_virtual_path(raw_path, &mp) {
+                Ok(p) => p,
+                Err(e) => {
+                    return serde_json::json!({
+                        "status": "error",
+                        "message": e,
+                    });
+                }
+            };
+            match db_c.set_pinned(&vpath, true) {
+                Ok(true) => {
+                    let (hydrated, failed) = match active_fuse_c.lock().unwrap().clone() {
+                        Some(fuse_fs) => fuse_fs.hydrate_pinned_target(&vpath),
+                        None => (0, 0),
+                    };
+                    serde_json::json!({
+                        "status": "ok",
+                        "path": vpath,
+                        "pinned": true,
+                        "hydrated": hydrated,
+                        "failed": failed,
+                        "message": format!(
+                            "Pinned '{}' for offline access (hydrated: {}, failed: {})",
+                            vpath, hydrated, failed
+                        ),
+                    })
+                }
+                Ok(false) => serde_json::json!({
+                    "status": "error",
+                    "message": format!("Path not found in metadata index: {}", vpath),
+                }),
+                Err(e) => serde_json::json!({
+                    "status": "error",
+                    "message": e,
+                }),
+            }
+        });
+
+        // unpin
+        let db_c = db.clone();
+        let mount_point_c = Arc::clone(&mount_point);
+        self.ipc_server.register_handler("unpin", move |args| {
+            let Some(raw_path) = args.get("path").and_then(|v| v.as_str()) else {
+                return serde_json::json!({
+                    "status": "error",
+                    "message": "Missing 'path' argument",
+                });
+            };
+            let mp = mount_point_c.lock().unwrap().clone();
+            let vpath = match normalize_pin_virtual_path(raw_path, &mp) {
+                Ok(p) => p,
+                Err(e) => {
+                    return serde_json::json!({
+                        "status": "error",
+                        "message": e,
+                    });
+                }
+            };
+            match db_c.set_pinned(&vpath, false) {
+                Ok(true) => serde_json::json!({
+                    "status": "ok",
+                    "path": vpath,
+                    "pinned": false,
+                    "message": format!("Unpinned '{}'; cached blocks can now be evicted", vpath),
+                }),
+                Ok(false) => serde_json::json!({
+                    "status": "error",
+                    "message": format!("Path not found in metadata index: {}", vpath),
+                }),
+                Err(e) => serde_json::json!({
+                    "status": "error",
+                    "message": e,
+                }),
+            }
+        });
+
+        // pinned
+        let db_c = db.clone();
+        self.ipc_server.register_handler("pinned", move |_| {
+            let paths = db_c.list_pinned_paths();
+            serde_json::json!({
+                "status": "ok",
+                "count": paths.len(),
+                "paths": paths,
+            })
+        });
+
+        // list-errors
+        let db_c = db.clone();
+        self.ipc_server.register_handler("list-errors", move |_| {
+            let errors = db_c.get_recent_errors(50);
+            let items: Vec<serde_json::Value> = errors
+                .into_iter()
+                .map(|(path, error)| {
+                    serde_json::json!({
+                        "path": path,
+                        "error": error,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "status": "ok",
+                "count": items.len(),
+                "items": items,
+            })
+        });
+
+        // resolve-conflict
+        let db_c = db.clone();
+        let cache_dir_c = cache_dir.clone();
+        let mount_point_c = Arc::clone(&mount_point);
+        let sync_engine_c = Arc::clone(&sync_engine);
+        self.ipc_server
+            .register_handler("resolve-conflict", move |args| {
+                let Some(raw_path) = args.get("path").and_then(|v| v.as_str()) else {
+                    return serde_json::json!({
+                        "status": "error",
+                        "message": "Missing 'path' argument",
+                    });
+                };
+                let strategy = args
+                    .get("strategy")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("keep-local");
+                let mp = mount_point_c.lock().unwrap().clone();
+                let vpath = match normalize_pin_virtual_path(raw_path, &mp) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return serde_json::json!({
+                            "status": "error",
+                            "message": e,
+                        });
+                    }
+                };
+                match db_c.resolve_error_node(&vpath, strategy, &cache_dir_c) {
+                    Ok(msg) => {
+                        sync_engine_c.clear_error_status();
+                        if (strategy == "keep-local" || strategy == "keep-both")
+                            && !sync_engine_c.is_paused()
+                            && !sync_engine_c.is_offline_mode()
+                        {
+                            let engine = Arc::clone(&sync_engine_c);
+                            thread::spawn(move || {
+                                engine.process_uploads();
+                            });
+                        }
+                        serde_json::json!({
+                            "status": "ok",
+                            "path": vpath,
+                            "strategy": strategy,
+                            "message": msg,
+                        })
+                    }
+                    Err(e) => serde_json::json!({
+                        "status": "error",
+                        "message": e,
+                    }),
+                }
+            });
+
+        // restore-trash
+        let client_c = client.clone();
+        self.ipc_server
+            .register_handler("restore-trash", move |args| {
+                let Some(link_id) = args
+                    .get("link_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                else {
+                    return serde_json::json!({
+                        "status": "error",
+                        "message": "Missing or empty 'link_id' argument",
+                    });
+                };
+                if client_c.restore_from_trash(link_id) {
+                    serde_json::json!({
+                        "status": "ok",
+                        "link_id": link_id,
+                        "message": format!("Restored link '{}' from Proton Drive Trash", link_id),
+                    })
+                } else {
+                    serde_json::json!({
+                        "status": "error",
+                        "message": format!("Failed to restore link '{}' from Trash", link_id),
+                    })
+                }
             });
 
         // login

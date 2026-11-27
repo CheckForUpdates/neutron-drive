@@ -469,9 +469,28 @@ impl PdHttpClient {
         query: &[(&str, &str)],
         authenticated: bool,
     ) -> Result<T, HttpError> {
+        self.get_json_with_headers(family, path, query, &[], authenticated)
+    }
+
+    pub fn get_json_with_headers<T: DeserializeOwned>(
+        &self,
+        family: RateLimitFamily,
+        path: &str,
+        query: &[(&str, &str)],
+        extra_headers: &[(&str, &str)],
+        authenticated: bool,
+    ) -> Result<T, HttpError> {
         let url = self.resolve_url(path, query)?;
-        let bytes =
-            self.execute_with_retries(family, Method::GET, &url, None, None, authenticated, true)?;
+        let bytes = self.execute_with_retries_headers(
+            family,
+            Method::GET,
+            &url,
+            None,
+            None,
+            extra_headers,
+            authenticated,
+            true,
+        )?;
         serde_json::from_slice(&bytes)
             .map_err(|e| HttpError::Decode(format!("Failed decoding JSON from {}: {}", path, e)))
     }
@@ -686,7 +705,12 @@ impl PdHttpClient {
 
             let resp_res = self.runtime.block_on(async {
                 let mut req = self.client.request(method.clone(), url);
-                req = req.header("x-pm-appversion", &self.app_version);
+                if !extra_headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("x-pm-appversion"))
+                {
+                    req = req.header("x-pm-appversion", &self.app_version);
+                }
                 req = req.header("x-pm-locale", DEFAULT_LOCALE);
                 req = req.header("Accept", PROTON_ACCEPT_HEADER);
                 for &(k, v) in extra_headers {

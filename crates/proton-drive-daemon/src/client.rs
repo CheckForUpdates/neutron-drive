@@ -25,7 +25,21 @@ pub trait RemoteDrive: Send + Sync {
     fn create_folder(&self, remote_parent: &str, folder_name: &str) -> bool;
     fn rename(&self, remote_path: &str, new_name: &str) -> bool;
     fn move_node(&self, source_path: &str, target_parent_path: &str) -> bool;
+    fn supports_atomic_move_and_rename(&self) -> bool {
+        false
+    }
+    fn move_and_rename(
+        &self,
+        _source_path: &str,
+        _target_parent_path: &str,
+        _new_name: &str,
+    ) -> bool {
+        false
+    }
     fn trash(&self, remote_path: &str) -> bool;
+    fn restore_from_trash(&self, _link_id: &str) -> bool {
+        false
+    }
     fn delete(&self, remote_path: &str) -> bool;
     fn get_storage_quota(&self) -> StorageQuota;
     fn backend_name(&self) -> &'static str {
@@ -171,8 +185,20 @@ pub struct MoveNodeCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveAndRenameCall {
+    pub source_path: String,
+    pub target_parent_path: String,
+    pub new_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrashCall {
     pub remote_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreTrashCall {
+    pub link_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,7 +216,9 @@ pub enum RemoteCall {
     CreateFolder(CreateFolderCall),
     Rename(RenameCall),
     MoveNode(MoveNodeCall),
+    MoveAndRename(MoveAndRenameCall),
     Trash(TrashCall),
+    RestoreTrash(RestoreTrashCall),
     Delete(DeleteCall),
     GetStorageQuota,
 }
@@ -207,7 +235,10 @@ struct FakeRemoteDriveInner {
     create_folder_success: bool,
     rename_success: bool,
     move_node_success: bool,
+    atomic_move_and_rename_supported: bool,
+    move_and_rename_success: bool,
     trash_success: bool,
+    restore_trash_success: bool,
     delete_success: bool,
     quota: StorageQuota,
     calls: Vec<RemoteCall>,
@@ -226,7 +257,10 @@ impl Default for FakeRemoteDriveInner {
             create_folder_success: true,
             rename_success: true,
             move_node_success: true,
+            atomic_move_and_rename_supported: false,
+            move_and_rename_success: true,
             trash_success: true,
+            restore_trash_success: true,
             delete_success: true,
             quota: StorageQuota::default(),
             calls: Vec::new(),
@@ -298,9 +332,24 @@ impl FakeRemoteDrive {
         inner.move_node_success = success;
     }
 
+    pub fn set_atomic_move_and_rename_supported(&self, supported: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.atomic_move_and_rename_supported = supported;
+    }
+
+    pub fn set_move_and_rename_result(&self, success: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.move_and_rename_success = success;
+    }
+
     pub fn set_trash_result(&self, success: bool) {
         let mut inner = self.inner.lock().unwrap();
         inner.trash_success = success;
+    }
+
+    pub fn set_restore_trash_result(&self, success: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.restore_trash_success = success;
     }
 
     pub fn set_delete_result(&self, success: bool) {
@@ -383,6 +432,18 @@ impl FakeRemoteDrive {
             .collect()
     }
 
+    pub fn move_and_rename_calls(&self) -> Vec<MoveAndRenameCall> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .calls
+            .iter()
+            .filter_map(|c| match c {
+                RemoteCall::MoveAndRename(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn trash_calls(&self) -> Vec<TrashCall> {
         let inner = self.inner.lock().unwrap();
         inner
@@ -390,6 +451,18 @@ impl FakeRemoteDrive {
             .iter()
             .filter_map(|c| match c {
                 RemoteCall::Trash(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn restore_trash_calls(&self) -> Vec<RestoreTrashCall> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .calls
+            .iter()
+            .filter_map(|c| match c {
+                RemoteCall::RestoreTrash(t) => Some(t.clone()),
                 _ => None,
             })
             .collect()
@@ -522,12 +595,36 @@ impl RemoteDrive for FakeRemoteDrive {
         inner.move_node_success
     }
 
+    fn supports_atomic_move_and_rename(&self) -> bool {
+        self.inner.lock().unwrap().atomic_move_and_rename_supported
+    }
+
+    fn move_and_rename(&self, source_path: &str, target_parent_path: &str, new_name: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .calls
+            .push(RemoteCall::MoveAndRename(MoveAndRenameCall {
+                source_path: source_path.to_string(),
+                target_parent_path: target_parent_path.to_string(),
+                new_name: new_name.to_string(),
+            }));
+        inner.move_and_rename_success
+    }
+
     fn trash(&self, remote_path: &str) -> bool {
         let mut inner = self.inner.lock().unwrap();
         inner.calls.push(RemoteCall::Trash(TrashCall {
             remote_path: remote_path.to_string(),
         }));
         inner.trash_success
+    }
+
+    fn restore_from_trash(&self, link_id: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        inner.calls.push(RemoteCall::RestoreTrash(RestoreTrashCall {
+            link_id: link_id.to_string(),
+        }));
+        inner.restore_trash_success
     }
 
     fn delete(&self, remote_path: &str) -> bool {

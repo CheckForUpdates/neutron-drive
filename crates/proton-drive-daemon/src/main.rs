@@ -87,6 +87,41 @@ enum Commands {
 
     #[command(about = "Force a metadata resync with cloud")]
     Refresh,
+
+    #[command(about = "Pin a file or folder for offline access")]
+    Pin {
+        #[arg(help = "Virtual drive path (e.g. /Docs/spec.pdf) or local mount path")]
+        path: String,
+    },
+
+    #[command(about = "Unpin a file or folder so it can be evicted from cache")]
+    Unpin {
+        #[arg(help = "Virtual drive path (e.g. /Docs/spec.pdf) or local mount path")]
+        path: String,
+    },
+
+    #[command(about = "List files and folders pinned for offline access")]
+    Pinned,
+
+    #[command(
+        about = "Resolve a sync error or conflict using keep-local, keep-remote, or keep-both"
+    )]
+    ResolveConflict {
+        #[arg(help = "Virtual drive path (e.g. /Docs/note.txt) or local mount path")]
+        path: String,
+        #[arg(
+            long,
+            default_value = "keep-local",
+            help = "Strategy: keep-local, keep-remote, or keep-both"
+        )]
+        strategy: String,
+    },
+
+    #[command(about = "Restore a trashed file or folder in Proton Drive by link ID")]
+    RestoreTrash {
+        #[arg(help = "Proton Drive LinkID to restore from Trash")]
+        link_id: String,
+    },
 }
 
 fn main() {
@@ -367,6 +402,131 @@ fn main() {
                 }
                 Err(e) => {
                     eprintln!("Failed to refresh: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::Pin { path } => {
+            let ipc = IpcClient::new(None);
+            match ipc.send_command("pin", serde_json::json!({ "path": path })) {
+                Ok(r) => {
+                    let msg = r
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("Pinned");
+                    if r.get("status").and_then(|s| s.as_str()) == Some("ok") {
+                        println!("{}", msg);
+                    } else {
+                        eprintln!("{}", msg);
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to pin path: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::Unpin { path } => {
+            let ipc = IpcClient::new(None);
+            match ipc.send_command("unpin", serde_json::json!({ "path": path })) {
+                Ok(r) => {
+                    let msg = r
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("Unpinned");
+                    if r.get("status").and_then(|s| s.as_str()) == Some("ok") {
+                        println!("{}", msg);
+                    } else {
+                        eprintln!("{}", msg);
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to unpin path: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::Pinned => {
+            let ipc = IpcClient::new(None);
+            match ipc.send_command("pinned", serde_json::json!({})) {
+                Ok(r) => {
+                    if r.get("status").and_then(|s| s.as_str()) != Some("ok") {
+                        let msg = r
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("Failed to list pinned paths");
+                        eprintln!("{}", msg);
+                        std::process::exit(1);
+                    }
+                    let paths = r
+                        .get("paths")
+                        .and_then(|p| p.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    if paths.is_empty() {
+                        println!("No pinned files or folders.");
+                    } else {
+                        for p in paths {
+                            if let Some(s) = p.as_str() {
+                                println!("{}", s);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to list pinned paths: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::ResolveConflict { path, strategy } => {
+            let ipc = IpcClient::new(None);
+            match ipc.send_command(
+                "resolve-conflict",
+                serde_json::json!({ "path": path, "strategy": strategy }),
+            ) {
+                Ok(r) => {
+                    let msg = r
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("Conflict resolved");
+                    if r.get("status").and_then(|s| s.as_str()) == Some("ok") {
+                        println!("{}", msg);
+                    } else {
+                        eprintln!("{}", msg);
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to resolve conflict: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::RestoreTrash { link_id } => {
+            let ipc = IpcClient::new(None);
+            match ipc.send_command("restore-trash", serde_json::json!({ "link_id": link_id })) {
+                Ok(r) => {
+                    let msg = r
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("Restored from Trash");
+                    if r.get("status").and_then(|s| s.as_str()) == Some("ok") {
+                        println!("{}", msg);
+                    } else {
+                        eprintln!("{}", msg);
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to restore from Trash: {}", e);
                     std::process::exit(1);
                 }
             }

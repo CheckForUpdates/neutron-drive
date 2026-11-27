@@ -570,9 +570,15 @@ fn test_v1_to_v2_native_columns_migration() {
         .unwrap();
     }
 
-    let db = MetadataDB::new(&db_path).expect("v1 -> v2 migration must succeed");
-    assert_eq!(db.schema_version().unwrap(), 2);
-    assert_eq!(db.get_setting("schema_version").as_deref(), Some("2"));
+    let db = MetadataDB::new(&db_path).expect("v1 -> v3 migration must succeed");
+    assert_eq!(
+        db.schema_version().unwrap(),
+        MetadataDB::CURRENT_SCHEMA_VERSION
+    );
+    assert_eq!(
+        db.get_setting("schema_version").as_deref(),
+        Some(MetadataDB::CURRENT_SCHEMA_VERSION.to_string().as_str())
+    );
 
     let migrated = db.get_node("/doc.txt").expect("Migrated row must exist");
     assert_eq!(migrated.cache_id, "cid-v1-1");
@@ -603,4 +609,65 @@ fn test_v1_to_v2_native_columns_migration() {
         .get_node_by_only_link_id("link-1")
         .expect("get_node_by_only_link_id must find node");
     assert_eq!(by_only.path, "/doc.txt");
+}
+
+#[test]
+fn test_migration_v2_to_v3_adds_pinned_column_with_default_false() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("v2.db");
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+             CREATE TABLE nodes (
+                 path TEXT PRIMARY KEY COLLATE BINARY,
+                 parent_path TEXT,
+                 name TEXT NOT NULL,
+                 type TEXT NOT NULL,
+                 size INTEGER DEFAULT 0,
+                 mtime REAL NOT NULL,
+                 local_cache_path TEXT,
+                 sync_status TEXT DEFAULT 'cloud_only',
+                 etag TEXT,
+                 uid TEXT,
+                 last_checked REAL,
+                 cache_id TEXT,
+                 generation INTEGER NOT NULL DEFAULT 0,
+                 remote_exists INTEGER NOT NULL DEFAULT 1,
+                 last_error TEXT,
+                 volume_id TEXT,
+                 share_id TEXT,
+                 link_id TEXT,
+                 parent_link_id TEXT,
+                 revision_id TEXT,
+                 name_hash TEXT
+             );
+             INSERT INTO nodes (
+                 path, parent_path, name, type, size, mtime, local_cache_path,
+                 sync_status, cache_id, generation, remote_exists, volume_id, link_id
+             ) VALUES (
+                 '/v2-file.txt', '/', 'v2-file.txt', 'file', 99, 1000.0, NULL,
+                 'cloud_only', 'cid-v2-1', 2, 1, 'vol-2', 'link-2'
+             );
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    }
+
+    let db = MetadataDB::new(&db_path).expect("v2 -> v3 migration must succeed");
+    assert_eq!(db.schema_version().unwrap(), 3);
+    assert_eq!(db.get_setting("schema_version").as_deref(), Some("3"));
+
+    let migrated = db
+        .get_node("/v2-file.txt")
+        .expect("Migrated v2 row must exist");
+    assert_eq!(migrated.cache_id, "cid-v2-1");
+    assert_eq!(migrated.link_id.as_deref(), Some("link-2"));
+    assert!(!migrated.pinned, "Existing rows must default pinned=false");
+    assert!(db.list_pinned_paths().is_empty());
+
+    assert_eq!(db.set_pinned("/v2-file.txt", true), Ok(true));
+    assert!(db.get_node("/v2-file.txt").unwrap().pinned);
+    assert_eq!(db.list_pinned_paths(), vec!["/v2-file.txt".to_string()]);
 }

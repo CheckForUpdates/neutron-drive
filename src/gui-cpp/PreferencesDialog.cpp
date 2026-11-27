@@ -15,6 +15,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QInputDialog>
+#include <QJsonArray>
 #include <QDialogButtonBox>
 #include <QSpinBox>
 #include <QDesktopServices>
@@ -175,8 +176,14 @@ void PreferencesDialog::initUi() {
     m_btnClearErrors->setEnabled(false);
     connect(m_btnClearErrors, &QPushButton::clicked, this, &PreferencesDialog::onClearErrors);
 
+    m_btnResolveErrors = new QPushButton("Resolve Conflicts...", grpAccount);
+    m_btnResolveErrors->setFixedWidth(150);
+    m_btnResolveErrors->setEnabled(false);
+    connect(m_btnResolveErrors, &QPushButton::clicked, this, &PreferencesDialog::onResolveErrors);
+
     rowErrorRecovery->addWidget(m_btnRetryErrors);
     rowErrorRecovery->addWidget(m_btnClearErrors);
+    rowErrorRecovery->addWidget(m_btnResolveErrors);
     rowErrorRecovery->addStretch();
     formAccount->addRow("Recovery:", rowErrorRecovery);
 
@@ -391,6 +398,7 @@ void PreferencesDialog::refreshData() {
                 m_lblSyncSummary->setText("Daemon not responding");
                 if (m_btnRetryErrors) m_btnRetryErrors->setEnabled(false);
                 if (m_btnClearErrors) m_btnClearErrors->setEnabled(false);
+                if (m_btnResolveErrors) m_btnResolveErrors->setEnabled(false);
                 emit daemonUnavailable("Daemon not responding");
                 return;
             }
@@ -437,6 +445,9 @@ void PreferencesDialog::refreshData() {
             }
             if (m_btnClearErrors) {
                 m_btnClearErrors->setEnabled(errorCount > 0);
+            }
+            if (m_btnResolveErrors) {
+                m_btnResolveErrors->setEnabled(errorCount > 0);
             }
 
             if (res.contains("quota") && res.value("quota").isObject()) {
@@ -690,7 +701,12 @@ void PreferencesDialog::onClearCache() {
 
         if (res.value("status").toString() == "ok") {
             int evicted = res.value("evicted").toInt();
-            QMessageBox::information(this, "Cache Cleared", QString("Successfully evicted %1 cached block files.").arg(evicted));
+            int skipped = res.value("skipped").toInt();
+            QString summary = QString("Successfully evicted %1 cached block files.").arg(evicted);
+            if (skipped > 0) {
+                summary += QString("\nSkipped %1 item(s) (open, dirty, or pinned for offline access).").arg(skipped);
+            }
+            QMessageBox::information(this, "Cache Cleared", summary);
         } else {
             QString message = res.value("message").toString();
             if (message.isEmpty()) {
@@ -704,6 +720,7 @@ void PreferencesDialog::onClearCache() {
 void PreferencesDialog::onRetryErrors() {
     if (m_btnRetryErrors) m_btnRetryErrors->setEnabled(false);
     if (m_btnClearErrors) m_btnClearErrors->setEnabled(false);
+    if (m_btnResolveErrors) m_btnResolveErrors->setEnabled(false);
 
     QPointer<PreferencesDialog> self(this);
     m_client->sendCommandAsync("retry-errors", [this, self](const QJsonObject &res) {
@@ -726,6 +743,7 @@ void PreferencesDialog::onRetryErrors() {
 void PreferencesDialog::onClearErrors() {
     if (m_btnRetryErrors) m_btnRetryErrors->setEnabled(false);
     if (m_btnClearErrors) m_btnClearErrors->setEnabled(false);
+    if (m_btnResolveErrors) m_btnResolveErrors->setEnabled(false);
 
     QPointer<PreferencesDialog> self(this);
     m_client->sendCommandAsync("clear-errors", [this, self](const QJsonObject &res) {
@@ -742,6 +760,117 @@ void PreferencesDialog::onClearErrors() {
             }
         }
         refreshData();
+    });
+}
+
+void PreferencesDialog::resolveConflict(const QString &path, const QString &strategy, bool interactiveDialogs) {
+    QJsonObject args;
+    args["path"] = path;
+    args["strategy"] = strategy;
+
+    QPointer<PreferencesDialog> self(this);
+    m_client->sendCommandAsync("resolve-conflict", args, [this, self, path, strategy, interactiveDialogs](const QJsonObject &res) {
+        if (!self) {
+            return;
+        }
+        const bool ok = res.value("status").toString() == "ok";
+        QString message = res.value("message").toString();
+        if (message.isEmpty()) {
+            message = ok ? QString("Conflict resolved") : QString("Failed to resolve conflict");
+        }
+        emit conflictResolved(ok, path, strategy, message);
+        if (interactiveDialogs && qEnvironmentVariable("QT_QPA_PLATFORM") != QString("offscreen")) {
+            if (ok) {
+                QMessageBox::information(this, "Conflict Resolved", message);
+            } else {
+                QMessageBox::warning(this, "Conflict Resolution Error", message);
+            }
+        }
+        if (ok) {
+            refreshData();
+        }
+    });
+}
+
+void PreferencesDialog::onResolveErrors() {
+    QPointer<PreferencesDialog> self(this);
+    m_client->sendCommandAsync("list-errors", [this, self](const QJsonObject &res) {
+        if (!self) {
+            return;
+        }
+        if (res.value("status").toString() != "ok") {
+            QString message = res.value("message").toString();
+            if (message.isEmpty()) {
+                message = "Failed to query sync errors";
+            }
+            if (qEnvironmentVariable("QT_QPA_PLATFORM") != QString("offscreen")) {
+                QMessageBox::warning(this, "Sync Conflicts", message);
+            }
+            return;
+        }
+
+        const QJsonArray items = res.value("items").toArray();
+        if (items.isEmpty()) {
+            if (qEnvironmentVariable("QT_QPA_PLATFORM") != QString("offscreen")) {
+                QMessageBox::information(this, "Sync Conflicts", "No pending sync conflicts or errors.");
+            }
+            refreshData();
+            return;
+        }
+
+        QStringList labels;
+        QStringList paths;
+        for (const QJsonValue &val : items) {
+            const QJsonObject obj = val.toObject();
+            const QString path = obj.value("path").toString();
+            const QString err = obj.value("error").toString();
+            if (!path.isEmpty()) {
+                paths.append(path);
+                labels.append(QString("%1 (%2)").arg(path, err));
+            }
+        }
+        if (paths.isEmpty()) {
+            return;
+        }
+
+        bool okItem = false;
+        const QString chosenLabel = QInputDialog::getItem(
+            this,
+            "Resolve Sync Conflict",
+            "Select item to resolve:",
+            labels,
+            0,
+            false,
+            &okItem
+        );
+        if (!okItem) {
+            return;
+        }
+        const int idx = labels.indexOf(chosenLabel);
+        if (idx < 0 || idx >= paths.size()) {
+            return;
+        }
+
+        const QStringList strategies = {
+            "keep-local (Re-upload local file)",
+            "keep-remote (Revert to cloud version)",
+            "keep-both (Save local copy as conflict file)"
+        };
+        bool okStrat = false;
+        const QString chosenStrat = QInputDialog::getItem(
+            this,
+            "Choose Resolution Strategy",
+            QString("Action for %1:").arg(paths.at(idx)),
+            strategies,
+            0,
+            false,
+            &okStrat
+        );
+        if (!okStrat) {
+            return;
+        }
+        const QString strategyKey = chosenStrat.section(' ', 0, 0);
+        resolveConflict(paths.at(idx), strategyKey, true);
     });
 }
 

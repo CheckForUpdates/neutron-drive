@@ -859,3 +859,85 @@ fn test_remote_failure_aborts_without_local_mutation() {
     assert!(fixture.db.get_node("/remote_fail.txt").is_some());
     assert!(fixture.db.get_node("/remote_fail2.txt").is_none());
 }
+
+#[test]
+fn test_atomic_cross_parent_rename_succeeds_even_when_both_intermediate_paths_exist() {
+    let fixture = TestFixture::new();
+    let fuse = fixture.create_fuse();
+
+    let _ = fuse.create_dir("/", "a").expect("create /a");
+    let _ = fuse.create_dir("/", "b").expect("create /b");
+
+    for (path, parent, name, cache_id) in [
+        ("/a/old", "/a", "old", "a-old-cache-id"),
+        ("/a/new", "/a", "new", "a-new-cache-id"),
+        ("/b/old", "/b", "old", "b-old-cache-id"),
+    ] {
+        fixture
+            .db
+            .upsert_node(
+                path,
+                parent,
+                name,
+                "file",
+                100,
+                None,
+                None,
+                Some(SyncStatus::SYNCED),
+                None,
+                None,
+                Some(cache_id),
+                Some(1),
+                Some(true),
+                None,
+            )
+            .expect("upsert remote-synced node");
+    }
+
+    let old_ino = fuse.get_or_create_inode("/a/old");
+    fixture.fake_remote.clear_recorded_calls();
+
+    // Non-atomic backend cannot stage /a/old -> /b/new when both /a/new and /b/old exist.
+    let err = fuse.rename_node("/a", "old", "/b", "new");
+    assert_eq!(err, Err(libc::EEXIST));
+    assert_eq!(fixture.fake_remote.recorded_calls().len(), 0);
+
+    // Atomic backend failure leaves local DB untouched.
+    fixture
+        .fake_remote
+        .set_atomic_move_and_rename_supported(true);
+    fixture.fake_remote.set_move_and_rename_result(false);
+    let err = fuse.rename_node("/a", "old", "/b", "new");
+    assert_eq!(err, Err(libc::EIO));
+    assert!(fixture.db.get_node("/a/old").is_some());
+    assert!(fixture.db.get_node("/b/new").is_none());
+
+    // Atomic backend succeeds in a single move_and_rename call with no intermediate collision.
+    fixture.fake_remote.set_move_and_rename_result(true);
+    fixture.fake_remote.clear_recorded_calls();
+    let res = fuse.rename_node("/a", "old", "/b", "new");
+    assert_eq!(res, Ok(()));
+
+    let calls = fixture.fake_remote.move_and_rename_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].source_path, "/my-files/a/old");
+    assert_eq!(calls[0].target_parent_path, "/my-files/b");
+    assert_eq!(calls[0].new_name, "new");
+    assert!(fixture.fake_remote.rename_calls().is_empty());
+    assert!(fixture.fake_remote.move_node_calls().is_empty());
+
+    assert!(fixture.db.get_node("/a/old").is_none());
+    let moved = fixture.db.get_node("/b/new").expect("moved node at /b/new");
+    assert_eq!(moved.parent_path, "/b");
+    assert_eq!(moved.name, "new");
+    assert_eq!(moved.cache_id, "a-old-cache-id");
+    assert_eq!(fuse.get_path_for_inode(old_ino), Some("/b/new".to_string()));
+    assert_eq!(
+        fixture.db.get_node("/a/new").unwrap().cache_id,
+        "a-new-cache-id"
+    );
+    assert_eq!(
+        fixture.db.get_node("/b/old").unwrap().cache_id,
+        "b-old-cache-id"
+    );
+}
