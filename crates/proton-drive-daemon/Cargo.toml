@@ -5,7 +5,6 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Unofficial native Rust FUSE daemon and CLI backend for Proton Drive on Linux"
 repository = "https://github.com/CheckForUpdates/neutron-drive"
-homepage = "https://github.com/CheckForUpdates/neutron-drive"
 readme = "../../README.md"
 
 [lib]

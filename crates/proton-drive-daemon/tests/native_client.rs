@@ -3629,10 +3629,7 @@ fn test_native_browser_sso_session_fork_login_and_vault_persistence() {
         !fork_poll_headers.is_empty(),
         "Expected /auth/v4/sessions/forks/{{selector}} request"
     );
-    for (_, path, hdrs) in fork_init_headers
-        .into_iter()
-        .chain(fork_poll_headers.into_iter())
-    {
+    for (_, path, hdrs) in fork_init_headers.into_iter().chain(fork_poll_headers) {
         assert_eq!(
             hdrs.get("x-pm-appversion").map(String::as_str),
             Some("cli-drive@0.9.0"),
