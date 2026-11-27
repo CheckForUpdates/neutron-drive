@@ -408,6 +408,19 @@ pub fn reconcile_directory(
     Ok(())
 }
 
+fn is_protected_by_pin(node: &Node, pinned_roots: &[String]) -> bool {
+    if node.pinned {
+        return true;
+    }
+    pinned_roots.iter().any(|root| {
+        if root == "/" || root == &node.path {
+            return true;
+        }
+        let prefix = format!("{}/", root.trim_end_matches('/'));
+        node.path.starts_with(&prefix)
+    })
+}
+
 pub fn evict_cache_by_policy(
     db: &MetadataDB,
     cache_dir: &Path,
@@ -416,6 +429,7 @@ pub fn evict_cache_by_policy(
     ttl: Option<Duration>,
 ) -> (usize, usize) {
     let nodes = db.get_all_nodes();
+    let pinned_roots = db.list_pinned_paths();
     let mut evicted = 0;
     let mut skipped = 0;
     let mut total_bytes_on_disk: u64 = 0;
@@ -449,6 +463,7 @@ pub fn evict_cache_by_policy(
 
         if node.sync_status != SyncStatus::SYNCED
             || !node.remote_exists
+            || is_protected_by_pin(&node, &pinned_roots)
             || activity.is_inflight(&node.cache_id)
             || activity.is_inflight(&node.path)
             || activity.has_open_handle(&node.cache_id)
@@ -885,6 +900,7 @@ impl ProtonDriveFUSE {
 
     pub fn evict_clean_cache(&self) -> (usize, usize) {
         let nodes = self.db.get_all_nodes();
+        let pinned_roots = self.db.list_pinned_paths();
         let mut evicted = 0;
         let mut skipped = 0;
 
@@ -892,7 +908,10 @@ impl ProtonDriveFUSE {
             if node.node_type != "file" {
                 continue;
             }
-            if node.sync_status != SyncStatus::SYNCED || !node.remote_exists {
+            if node.sync_status != SyncStatus::SYNCED
+                || !node.remote_exists
+                || is_protected_by_pin(&node, &pinned_roots)
+            {
                 skipped += 1;
                 continue;
             }
@@ -915,6 +934,51 @@ impl ProtonDriveFUSE {
             skipped += 1;
         }
         (evicted, skipped)
+    }
+
+    pub fn hydrate_pinned_target(&self, virtual_path: &str) -> (usize, usize) {
+        let Some(target) = self.db.get_node(virtual_path) else {
+            return (0, 0);
+        };
+
+        if target.node_type == "file" {
+            let needs_hydration = target.remote_exists
+                && (target.sync_status == SyncStatus::CLOUD_ONLY
+                    || target.local_cache_path.is_none());
+            if !needs_hydration {
+                return (0, 0);
+            }
+            return match self.hydrate(&target.path, &target) {
+                Ok(_) => (1, 0),
+                Err(_) => (0, 1),
+            };
+        }
+
+        let prefix = if virtual_path == "/" {
+            "/".to_string()
+        } else {
+            format!("{}/", virtual_path.trim_end_matches('/'))
+        };
+        let mut hydrated = 0;
+        let mut failed = 0;
+        for node in self.db.get_all_nodes() {
+            if node.node_type != "file" || !node.remote_exists {
+                continue;
+            }
+            if virtual_path != "/" && !node.path.starts_with(&prefix) {
+                continue;
+            }
+            let needs_hydration =
+                node.sync_status == SyncStatus::CLOUD_ONLY || node.local_cache_path.is_none();
+            if !needs_hydration {
+                continue;
+            }
+            match self.hydrate(&node.path, &node) {
+                Ok(_) => hydrated += 1,
+                Err(_) => failed += 1,
+            }
+        }
+        (hydrated, failed)
     }
 
     pub fn evict_cache_by_policy(
@@ -1143,9 +1207,12 @@ impl ProtonDriveFUSE {
 
         let is_cross_parent_rename =
             norm_old_parent != norm_new_parent && old_name != new_name && node.remote_exists;
+        let use_atomic_move_and_rename =
+            is_cross_parent_rename && self.client.supports_atomic_move_and_rename();
 
-        // Pre-validate non-colliding intermediate path before any remote mutation.
-        let use_rename_then_move = if is_cross_parent_rename {
+        // Pre-validate non-colliding intermediate path before any remote mutation
+        // when the backend must sequence separate rename and move calls.
+        let use_rename_then_move = if is_cross_parent_rename && !use_atomic_move_and_rename {
             let inter_rename_first = Self::join_fuse_path(norm_old_parent, new_name);
             let inter_move_first = Self::join_fuse_path(norm_new_parent, old_name);
             if self.db.get_node(&inter_rename_first).is_none() {
@@ -1195,7 +1262,10 @@ impl ProtonDriveFUSE {
         if node.remote_exists {
             let remote_old = self.to_remote_path(&old_path);
             let remote_new_parent = self.to_remote_path(norm_new_parent);
-            let success = if is_cross_parent_rename {
+            let success = if use_atomic_move_and_rename {
+                self.client
+                    .move_and_rename(&remote_old, &remote_new_parent, new_name)
+            } else if is_cross_parent_rename {
                 if use_rename_then_move {
                     if !self.client.rename(&remote_old, new_name) {
                         false

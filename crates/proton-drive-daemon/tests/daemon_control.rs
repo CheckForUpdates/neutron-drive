@@ -4,8 +4,11 @@ use std::fs;
 use std::thread;
 use std::time::Duration;
 
+use neutron_drive_daemon::client::RemoteNode;
 use serde_json::json;
-use support::{load_config_from, save_config_to, Config, ProtonDriveDaemon, TestFixture};
+use support::{
+    load_config_from, save_config_to, Config, ProtonDriveDaemon, SyncStatus, TestFixture,
+};
 
 #[test]
 fn test_daemon_startup_and_graceful_stop() {
@@ -933,6 +936,294 @@ fn test_pause_during_active_poll_stops_upload_and_preserves_paused_status() {
     assert_eq!(st.get("is_paused").and_then(|v| v.as_bool()), Some(true));
     assert_eq!(st.get("error_count").and_then(|v| v.as_u64()), Some(1));
     assert_eq!(fixture.fake_remote.upload_calls().len(), 0);
+
+    daemon.stop();
+}
+
+#[test]
+fn test_ipc_pin_unpin_and_list_pinned_paths() {
+    let fixture = TestFixture::new();
+    fixture.fake_remote.set_list_result(
+        "/my-files",
+        Ok(vec![RemoteNode {
+            name: "Docs".to_string(),
+            node_type: "folder".to_string(),
+            size: 0,
+            modify_time: Some(1000.0),
+            uid: Some("docs-uid".to_string()),
+        }]),
+    );
+    fixture.fake_remote.set_list_result(
+        "/my-files/Docs",
+        Ok(vec![RemoteNode {
+            name: "spec.md".to_string(),
+            node_type: "file".to_string(),
+            size: 128,
+            modify_time: Some(1000.0),
+            uid: Some("spec-uid".to_string()),
+        }]),
+    );
+    fixture
+        .db
+        .upsert_node(
+            "/Docs",
+            "/",
+            "Docs",
+            "folder",
+            0,
+            None,
+            None,
+            Some(SyncStatus::SYNCED),
+            None,
+            None,
+            Some("docs-cid"),
+            Some(1),
+            Some(true),
+            None,
+        )
+        .unwrap();
+    fixture
+        .db
+        .upsert_node(
+            "/Docs/spec.md",
+            "/Docs",
+            "spec.md",
+            "file",
+            128,
+            None,
+            None,
+            Some(SyncStatus::CLOUD_ONLY),
+            None,
+            None,
+            Some("spec-cid"),
+            Some(1),
+            Some(true),
+            None,
+        )
+        .unwrap();
+
+    let daemon = fixture.create_daemon();
+    daemon.start().expect("Daemon start failed");
+    let ipc = fixture.create_ipc_client();
+
+    // Pin using local mount-point prefixed path
+    let mount_prefixed = fixture.mount_dir.join("Docs/spec.md");
+    let pin_resp = ipc
+        .send_command("pin", json!({ "path": mount_prefixed }))
+        .unwrap();
+    assert_eq!(pin_resp["status"], "ok");
+    assert_eq!(pin_resp["path"], "/Docs/spec.md");
+    assert_eq!(pin_resp["pinned"], true);
+
+    let list_resp = ipc.send_command("pinned", json!({})).unwrap();
+    assert_eq!(list_resp["status"], "ok");
+    assert_eq!(list_resp["count"], 1);
+    assert_eq!(list_resp["paths"], json!(["/Docs/spec.md"]));
+
+    let status_resp = ipc.send_command("status", json!({})).unwrap();
+    assert_eq!(status_resp["pinned_count"], 1);
+
+    // Missing path returns error
+    let missing_resp = ipc
+        .send_command("pin", json!({ "path": "/Docs/missing.md" }))
+        .unwrap();
+    assert_eq!(missing_resp["status"], "error");
+
+    // Traversal segment is rejected
+    let trav_resp = ipc
+        .send_command("pin", json!({ "path": "/Docs/../etc/passwd" }))
+        .unwrap();
+    assert_eq!(trav_resp["status"], "error");
+
+    // Unpin clears pinned state
+    let unpin_resp = ipc
+        .send_command("unpin", json!({ "path": "/Docs/spec.md" }))
+        .unwrap();
+    assert_eq!(unpin_resp["status"], "ok");
+    assert_eq!(unpin_resp["pinned"], false);
+
+    let list_after = ipc.send_command("pinned", json!({})).unwrap();
+    assert_eq!(list_after["count"], 0);
+    assert_eq!(list_after["paths"], json!([]));
+
+    daemon.stop();
+}
+
+#[test]
+fn test_ipc_list_errors_resolve_conflict_and_restore_trash() {
+    let fixture = TestFixture::new();
+    fixture.fake_remote.set_list_result(
+        "/my-files",
+        Ok(vec![
+            RemoteNode {
+                name: "keep_local.txt".to_string(),
+                node_type: "file".to_string(),
+                size: 11,
+                modify_time: Some(1000.0),
+                uid: Some("kl-uid".to_string()),
+            },
+            RemoteNode {
+                name: "keep_remote.txt".to_string(),
+                node_type: "file".to_string(),
+                size: 11,
+                modify_time: Some(1000.0),
+                uid: Some("kr-uid".to_string()),
+            },
+            RemoteNode {
+                name: "keep_both.txt".to_string(),
+                node_type: "file".to_string(),
+                size: 14,
+                modify_time: Some(1000.0),
+                uid: Some("kb-uid".to_string()),
+            },
+        ]),
+    );
+
+    let cache_kl = fixture.cache_dir.join("kl-cid.dat");
+    let cache_kr = fixture.cache_dir.join("kr-cid.dat");
+    let cache_kb = fixture.cache_dir.join("kb-cid.dat");
+    let cache_lo = fixture.cache_dir.join("lo-cid.dat");
+    fs::write(&cache_kl, b"local-edits").unwrap();
+    fs::write(&cache_kr, b"stale-local").unwrap();
+    fs::write(&cache_kb, b"conflict-bytes").unwrap();
+    fs::write(&cache_lo, b"only-local-bytes").unwrap();
+
+    for (path, name, size, cache_p, cid, remote_exists, err) in [
+        (
+            "/keep_local.txt",
+            "keep_local.txt",
+            11,
+            &cache_kl,
+            "kl-cid",
+            true,
+            "upload conflict",
+        ),
+        (
+            "/keep_remote.txt",
+            "keep_remote.txt",
+            11,
+            &cache_kr,
+            "kr-cid",
+            true,
+            "upload conflict",
+        ),
+        (
+            "/keep_both.txt",
+            "keep_both.txt",
+            14,
+            &cache_kb,
+            "kb-cid",
+            true,
+            "upload conflict",
+        ),
+        (
+            "/local_only_err.txt",
+            "local_only_err.txt",
+            16,
+            &cache_lo,
+            "lo-cid",
+            false,
+            "network timeout",
+        ),
+    ] {
+        fixture
+            .db
+            .upsert_node(
+                path,
+                "/",
+                name,
+                "file",
+                size,
+                None,
+                Some(&cache_p.to_string_lossy()),
+                Some(SyncStatus::ERROR),
+                None,
+                None,
+                Some(cid),
+                Some(1),
+                Some(remote_exists),
+                Some(err),
+            )
+            .unwrap();
+    }
+
+    let daemon = fixture.create_daemon_with_config(Config {
+        mount_point: fixture.mount_dir.to_string_lossy().to_string(),
+        auto_mount_on_start: false,
+        sync_paused: true,
+        ..Default::default()
+    });
+    daemon.start().expect("Daemon start failed");
+    let ipc = fixture.create_ipc_client();
+
+    let errors_resp = ipc.send_command("list-errors", json!({})).unwrap();
+    assert_eq!(errors_resp["status"], "ok");
+    assert_eq!(errors_resp["count"], 4);
+
+    // 1. keep-local -> transitions to modified without discarding local cache
+    let kl_resp = ipc
+        .send_command(
+            "resolve-conflict",
+            json!({ "path": "/keep_local.txt", "strategy": "keep-local" }),
+        )
+        .unwrap();
+    assert_eq!(kl_resp["status"], "ok");
+    let kl_node = fixture.db.get_node("/keep_local.txt").unwrap();
+    assert_eq!(kl_node.sync_status, SyncStatus::MODIFIED);
+    assert!(kl_node.last_error.is_none());
+    assert!(cache_kl.exists());
+
+    // 2. keep-remote -> removes local cache and reverts to cloud_only
+    let kr_resp = ipc
+        .send_command(
+            "resolve-conflict",
+            json!({ "path": "/keep_remote.txt", "strategy": "keep-remote" }),
+        )
+        .unwrap();
+    assert_eq!(kr_resp["status"], "ok");
+    let kr_node = fixture.db.get_node("/keep_remote.txt").unwrap();
+    assert_eq!(kr_node.sync_status, SyncStatus::CLOUD_ONLY);
+    assert!(kr_node.local_cache_path.is_none());
+    assert!(!cache_kr.exists());
+
+    // 3. keep-both -> creates sibling (conflict) file and reverts original to cloud_only
+    let kb_resp = ipc
+        .send_command(
+            "resolve-conflict",
+            json!({ "path": "/keep_both.txt", "strategy": "keep-both" }),
+        )
+        .unwrap();
+    assert_eq!(kb_resp["status"], "ok");
+    let kb_orig = fixture.db.get_node("/keep_both.txt").unwrap();
+    assert_eq!(kb_orig.sync_status, SyncStatus::CLOUD_ONLY);
+    assert!(kb_orig.local_cache_path.is_none());
+    let kb_copy = fixture
+        .db
+        .get_node("/keep_both (conflict).txt")
+        .expect("Conflict sibling copy must be created");
+    assert_eq!(kb_copy.sync_status, SyncStatus::MODIFIED);
+    assert!(!kb_copy.remote_exists);
+    let copy_cache = kb_copy.local_cache_path.unwrap();
+    assert_eq!(fs::read(&copy_cache).unwrap(), b"conflict-bytes");
+
+    // 4. Local-only node refuses keep-remote so user bytes are not silently lost
+    let lo_resp = ipc
+        .send_command(
+            "resolve-conflict",
+            json!({ "path": "/local_only_err.txt", "strategy": "keep-remote" }),
+        )
+        .unwrap();
+    assert_eq!(lo_resp["status"], "error");
+    assert!(cache_lo.exists());
+
+    // 5. restore-trash invokes RemoteDrive::restore_from_trash
+    let restore_resp = ipc
+        .send_command("restore-trash", json!({ "link_id": "trashed-link-99" }))
+        .unwrap();
+    assert_eq!(restore_resp["status"], "ok");
+    let calls = fixture.fake_remote.restore_trash_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].link_id, "trashed-link-99");
 
     daemon.stop();
 }

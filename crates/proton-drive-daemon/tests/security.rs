@@ -43,6 +43,7 @@ fn test_permission_enforcement_and_private_modes() {
         generation: 1,
         remote_exists: true,
         last_error: None,
+        pinned: false,
     };
     let dir_attr = fuse.node_to_attr(10, &dir_node);
     assert_eq!(
@@ -81,6 +82,7 @@ fn test_permission_enforcement_and_private_modes() {
         generation: 1,
         remote_exists: true,
         last_error: None,
+        pinned: false,
     };
     let file_attr = fuse.node_to_attr(11, &file_node);
     assert_eq!(
@@ -1159,4 +1161,74 @@ fn test_install_sh_check_is_read_only_and_reports_a_preflight_summary() {
         !prefix.exists(),
         "--check must not create the installation prefix"
     );
+}
+
+#[test]
+fn test_pinned_files_and_folders_are_exempt_from_clean_and_policy_eviction() {
+    let fixture = TestFixture::new();
+    let fuse = fixture.create_fuse();
+
+    let _ = fuse.create_dir("/", "PinnedDir").expect("create PinnedDir");
+
+    let mk_cached = |vpath: &str, parent: &str, name: &str, payload: &[u8]| -> PathBuf {
+        let cid = generate_uuid();
+        let cache_file = fixture.cache_dir.join(format!("{}.dat", cid));
+        fs::write(&cache_file, payload).unwrap();
+        fs::set_permissions(&cache_file, fs::Permissions::from_mode(0o600)).unwrap();
+        fixture
+            .db
+            .upsert_node(
+                vpath,
+                parent,
+                name,
+                "file",
+                payload.len() as i64,
+                None,
+                Some(&cache_file.to_string_lossy()),
+                Some(SyncStatus::SYNCED),
+                None,
+                None,
+                Some(&cid),
+                Some(1),
+                Some(true),
+                None,
+            )
+            .unwrap();
+        cache_file
+    };
+
+    let pinned_file_cache = mk_cached("/pinned.bin", "/", "pinned.bin", &[b'p'; 64]);
+    let folder_child_cache = mk_cached(
+        "/PinnedDir/child.bin",
+        "/PinnedDir",
+        "child.bin",
+        &[b'c'; 64],
+    );
+    let unpinned_cache = mk_cached("/unpinned.bin", "/", "unpinned.bin", &[b'u'; 64]);
+
+    assert_eq!(fixture.db.set_pinned("/pinned.bin", true), Ok(true));
+    assert_eq!(fixture.db.set_pinned("/PinnedDir", true), Ok(true));
+
+    // Policy eviction (max 1 byte) must only evict the unpinned file
+    let (evicted, skipped) = fuse.evict_cache_by_policy(1, None);
+    assert_eq!(evicted, 1);
+    assert_eq!(skipped, 2);
+    assert!(pinned_file_cache.exists());
+    assert!(folder_child_cache.exists());
+    assert!(!unpinned_cache.exists());
+
+    // Manual clean cache eviction must also keep both pinned targets intact
+    let (evicted2, skipped2) = fuse.evict_clean_cache();
+    assert_eq!(evicted2, 0);
+    assert_eq!(skipped2, 3);
+    assert!(pinned_file_cache.exists());
+    assert!(folder_child_cache.exists());
+
+    // Once unpinned, clean cache eviction removes them
+    assert_eq!(fixture.db.set_pinned("/pinned.bin", false), Ok(true));
+    assert_eq!(fixture.db.set_pinned("/PinnedDir", false), Ok(true));
+    let (evicted3, _) = fuse.evict_clean_cache();
+    assert_eq!(evicted3, 2);
+    assert!(!pinned_file_cache.exists());
+    assert!(!folder_child_cache.exists());
 }

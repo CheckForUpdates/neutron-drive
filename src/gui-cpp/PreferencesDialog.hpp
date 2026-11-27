@@ -45,6 +45,9 @@ public:
     QPushButton *logoutButton() const { return m_btnLogout; }
     QPushButton *retryErrorsButton() const { return m_btnRetryErrors; }
     QPushButton *clearErrorsButton() const { return m_btnClearErrors; }
+    QPushButton *resolveErrorsButton() const { return m_btnResolveErrors; }
+
+    void resolveConflict(const QString &path, const QString &strategy, bool interactiveDialogs = true);
 
     void openNativeLoginPrompt(QWidget *dialogParent = nullptr);
     void submitNativeLogin(
@@ -80,12 +83,14 @@ signals:
     void mountPointChanged(const QString &mountPoint);
     void autoMountChanged(bool enabled);
     void startAtLoginChanged(bool enabled);
+    void conflictResolved(bool ok, const QString &path, const QString &strategy, const QString &message);
 
 private slots:
     void onChangeMountPoint();
     void onClearCache();
     void onRetryErrors();
     void onClearErrors();
+    void onResolveErrors();
     void onLogin();
     void onLogout();
     void onAutoMountToggled(bool checked);
@@ -127,6 +132,7 @@ private:
     QPushButton *m_btnLogout;
     QPushButton *m_btnRetryErrors;
     QPushButton *m_btnClearErrors;
+    QPushButton *m_btnResolveErrors;
 
     // Sync Tab
     QLabel *m_lblMountPoint;

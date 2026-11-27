@@ -781,6 +781,151 @@ impl NativeProtonClient {
         }
         Ok(())
     }
+
+    fn move_node_internal(
+        &self,
+        source_path: &str,
+        target_parent_path: &str,
+        new_name: Option<&str>,
+    ) -> bool {
+        let res = (|| -> Result<(), String> {
+            if let Some(name) = new_name {
+                if name.trim().is_empty() || name == "." || name == ".." || name.contains('/') {
+                    return Err(format!(
+                        "Invalid target name for move_and_rename: {:?}",
+                        name
+                    ));
+                }
+            }
+            let src_vpath = normalize_virtual_path(source_path);
+            let dst_parent_vpath = normalize_virtual_path(target_parent_path);
+            if src_vpath == "/" {
+                return Err("Cannot move root link".to_string());
+            }
+            if dst_parent_vpath == src_vpath
+                || dst_parent_vpath.starts_with(&format!("{}/", src_vpath))
+            {
+                return Err(format!(
+                    "Cannot move '{}' inside itself or descendant '{}'",
+                    src_vpath, dst_parent_vpath
+                ));
+            }
+
+            let (ctx, src_link) = self.resolve_path(&src_vpath)?;
+            let (_, dst_parent_link) = self.resolve_path(&dst_parent_vpath)?;
+
+            let old_parent_id = src_link
+                .parent_link_id
+                .as_deref()
+                .ok_or_else(|| "Cannot move root link".to_string())?;
+            let target_name = new_name.unwrap_or(&src_link.name);
+            if old_parent_id == dst_parent_link.link_id {
+                if target_name == src_link.name {
+                    return Ok(());
+                }
+                if self.rename(source_path, target_name) {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "Rename failed for '{}' -> '{}'",
+                    source_path, target_name
+                ));
+            }
+            let old_parent_keys = self
+                .node_cache
+                .get(old_parent_id)
+                .ok_or_else(|| "Source parent folder key not unlocked".to_string())?;
+            let dst_parent_keys = self
+                .node_cache
+                .get(&dst_parent_link.link_id)
+                .ok_or_else(|| "Destination parent folder key not unlocked".to_string())?;
+            let dst_hash_key = dst_parent_keys
+                .node_hash_key
+                .as_ref()
+                .ok_or_else(|| "Destination parent hash key missing".to_string())?;
+
+            let addr = self
+                .vault
+                .primary_address_key()
+                .ok_or_else(|| "No unlocked address key".to_string())?;
+
+            let child_keys = self.node_cache.get(&src_link.link_id);
+            let new_passphrase = if let Some(ref armored_pp) = src_link.raw_node_passphrase_armored
+            {
+                Encryptor::reencrypt_key_packet(
+                    armored_pp,
+                    &old_parent_keys.unlocked_key.armored_private,
+                    old_parent_keys.node_passphrase_raw.as_str(),
+                    &dst_parent_keys.unlocked_key.armored_public,
+                )?
+            } else if let Some(ref ck) = child_keys {
+                Encryptor::encrypt_text(
+                    ck.node_passphrase_raw.as_str(),
+                    &dst_parent_keys.unlocked_key.armored_public,
+                )?
+            } else {
+                return Err("Missing node passphrase material for move".to_string());
+            };
+
+            let enc_name = Encryptor::encrypt_and_sign_text(
+                target_name,
+                &dst_parent_keys.unlocked_key.armored_public,
+                &addr.passphrase,
+                &addr.unlocked.armored_private,
+            )?;
+            let new_hash = NameHasher::hash(target_name, dst_hash_key)?;
+
+            let params = MoveMultipleParameters {
+                parent_link_id: dst_parent_link.link_id.clone(),
+                links: vec![MoveMultipleLinkItem {
+                    link_id: src_link.link_id.clone(),
+                    name: enc_name,
+                    node_passphrase: new_passphrase.clone(),
+                    hash: new_hash.clone(),
+                    original_hash: src_link.name_hash.clone(),
+                    content_hash: None,
+                    node_passphrase_signature: None,
+                }],
+                name_signature_email: addr.email,
+                signature_email: None,
+                new_share_id: None,
+            };
+
+            let resp = DriveEndpoints::move_multiple(&self.http, &ctx.volume_id, &params)
+                .map_err(|e| format!("Move HTTP failed: {}", e))?;
+            if resp.code != 1000 && resp.code != 1001 {
+                return Err(format!("Move rejected with code {}", resp.code));
+            }
+            for item in &resp.responses {
+                item.response.ensure_ok("Move link item")?;
+            }
+
+            let new_vpath = if dst_parent_vpath == "/" {
+                format!("/{}", target_name)
+            } else {
+                format!("{}/{}", dst_parent_vpath, target_name)
+            };
+
+            self.relocate_cached_subtree(
+                &src_vpath,
+                &new_vpath,
+                &src_link.link_id,
+                new_name,
+                &new_hash,
+                Some(&dst_parent_link.link_id),
+                Some(&new_passphrase),
+            );
+            Ok(())
+        })();
+
+        if let Err(ref e) = res {
+            error!(
+                "Native move_node failed for {} -> {} (new_name={:?}): {}",
+                source_path, target_parent_path, new_name, e
+            );
+        }
+        res.is_ok()
+    }
 }
 
 impl RemoteDrive for NativeProtonClient {
@@ -1190,125 +1335,15 @@ impl RemoteDrive for NativeProtonClient {
     }
 
     fn move_node(&self, source_path: &str, target_parent_path: &str) -> bool {
-        let res = (|| -> Result<(), String> {
-            let src_vpath = normalize_virtual_path(source_path);
-            let dst_parent_vpath = normalize_virtual_path(target_parent_path);
-            if src_vpath == "/" {
-                return Err("Cannot move root link".to_string());
-            }
-            if dst_parent_vpath == src_vpath
-                || dst_parent_vpath.starts_with(&format!("{}/", src_vpath))
-            {
-                return Err(format!(
-                    "Cannot move '{}' inside itself or descendant '{}'",
-                    src_vpath, dst_parent_vpath
-                ));
-            }
+        self.move_node_internal(source_path, target_parent_path, None)
+    }
 
-            let (ctx, src_link) = self.resolve_path(&src_vpath)?;
-            let (_, dst_parent_link) = self.resolve_path(&dst_parent_vpath)?;
+    fn supports_atomic_move_and_rename(&self) -> bool {
+        true
+    }
 
-            let old_parent_id = src_link
-                .parent_link_id
-                .as_deref()
-                .ok_or_else(|| "Cannot move root link".to_string())?;
-            if old_parent_id == dst_parent_link.link_id {
-                return Ok(());
-            }
-            let old_parent_keys = self
-                .node_cache
-                .get(old_parent_id)
-                .ok_or_else(|| "Source parent folder key not unlocked".to_string())?;
-            let dst_parent_keys = self
-                .node_cache
-                .get(&dst_parent_link.link_id)
-                .ok_or_else(|| "Destination parent folder key not unlocked".to_string())?;
-            let dst_hash_key = dst_parent_keys
-                .node_hash_key
-                .as_ref()
-                .ok_or_else(|| "Destination parent hash key missing".to_string())?;
-
-            let addr = self
-                .vault
-                .primary_address_key()
-                .ok_or_else(|| "No unlocked address key".to_string())?;
-
-            let child_keys = self.node_cache.get(&src_link.link_id);
-            let new_passphrase = if let Some(ref armored_pp) = src_link.raw_node_passphrase_armored
-            {
-                Encryptor::reencrypt_key_packet(
-                    armored_pp,
-                    &old_parent_keys.unlocked_key.armored_private,
-                    old_parent_keys.node_passphrase_raw.as_str(),
-                    &dst_parent_keys.unlocked_key.armored_public,
-                )?
-            } else if let Some(ref ck) = child_keys {
-                Encryptor::encrypt_text(
-                    ck.node_passphrase_raw.as_str(),
-                    &dst_parent_keys.unlocked_key.armored_public,
-                )?
-            } else {
-                return Err("Missing node passphrase material for move".to_string());
-            };
-
-            let enc_name = Encryptor::encrypt_and_sign_text(
-                &src_link.name,
-                &dst_parent_keys.unlocked_key.armored_public,
-                &addr.passphrase,
-                &addr.unlocked.armored_private,
-            )?;
-            let new_hash = NameHasher::hash(&src_link.name, dst_hash_key)?;
-
-            let params = MoveMultipleParameters {
-                parent_link_id: dst_parent_link.link_id.clone(),
-                links: vec![MoveMultipleLinkItem {
-                    link_id: src_link.link_id.clone(),
-                    name: enc_name,
-                    node_passphrase: new_passphrase.clone(),
-                    hash: new_hash.clone(),
-                    original_hash: src_link.name_hash.clone(),
-                    content_hash: None,
-                    node_passphrase_signature: None,
-                }],
-                name_signature_email: addr.email,
-                signature_email: None,
-                new_share_id: None,
-            };
-
-            let resp = DriveEndpoints::move_multiple(&self.http, &ctx.volume_id, &params)
-                .map_err(|e| format!("Move HTTP failed: {}", e))?;
-            if resp.code != 1000 && resp.code != 1001 {
-                return Err(format!("Move rejected with code {}", resp.code));
-            }
-            for item in &resp.responses {
-                item.response.ensure_ok("Move link item")?;
-            }
-
-            let new_vpath = if dst_parent_vpath == "/" {
-                format!("/{}", src_link.name)
-            } else {
-                format!("{}/{}", dst_parent_vpath, src_link.name)
-            };
-
-            self.relocate_cached_subtree(
-                &src_vpath,
-                &new_vpath,
-                &src_link.link_id,
-                None,
-                &new_hash,
-                Some(&dst_parent_link.link_id),
-                Some(&new_passphrase),
-            );
-            Ok(())
-        })();
-
-        if let Err(ref e) = res {
-            error!(
-                "Native move_node failed for {} -> {}: {}",
-                source_path, target_parent_path, e
-            );
-        }
-        res.is_ok()
+    fn move_and_rename(&self, source_path: &str, target_parent_path: &str, new_name: &str) -> bool {
+        self.move_node_internal(source_path, target_parent_path, Some(new_name))
     }
 
     fn trash(&self, remote_path: &str) -> bool {
@@ -1342,6 +1377,38 @@ impl RemoteDrive for NativeProtonClient {
 
         if let Err(ref e) = res {
             error!("Native trash failed for {}: {}", remote_path, e);
+        }
+        res.is_ok()
+    }
+
+    fn restore_from_trash(&self, link_id: &str) -> bool {
+        let res = (|| -> Result<(), String> {
+            let trimmed = link_id.trim();
+            if trimmed.is_empty() {
+                return Err("LinkID cannot be empty".to_string());
+            }
+            let ctx = self.ensure_bootstrapped()?;
+            let resp = DriveEndpoints::restore_trash_links(
+                &self.http,
+                &ctx.volume_id,
+                &[trimmed.to_string()],
+            )
+            .map_err(|e| format!("Restore trash HTTP failed: {}", e))?;
+            if resp.code != 1000 && resp.code != 1001 {
+                return Err(format!("Restore trash rejected with code {}", resp.code));
+            }
+            for item in &resp.responses {
+                item.response.ensure_ok("Restore trashed link")?;
+            }
+            self.recently_trashed_by_path
+                .lock()
+                .unwrap()
+                .retain(|_, (_, lid)| lid != trimmed);
+            Ok(())
+        })();
+
+        if let Err(ref e) = res {
+            error!("Native restore_from_trash failed for {}: {}", link_id, e);
         }
         res.is_ok()
     }

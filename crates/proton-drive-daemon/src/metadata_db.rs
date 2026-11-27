@@ -51,12 +51,14 @@ pub struct Node {
     pub revision_id: Option<String>,
     #[serde(default)]
     pub name_hash: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 const NODE_SELECT_COLUMNS: &str =
     "path, parent_path, name, type, size, mtime, local_cache_path, sync_status,
      etag, uid, last_checked, cache_id, generation, remote_exists, last_error,
-     volume_id, share_id, link_id, parent_link_id, revision_id, name_hash";
+     volume_id, share_id, link_id, parent_link_id, revision_id, name_hash, pinned";
 
 pub fn now_sec() -> f64 {
     SystemTime::now()
@@ -200,7 +202,7 @@ pub struct MetadataDB {
 }
 
 impl MetadataDB {
-    pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+    pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
     pub fn new(db_path: &Path) -> Result<Self, rusqlite::Error> {
         if db_path.as_os_str() != ":memory:" {
@@ -322,7 +324,8 @@ impl MetadataDB {
                     link_id TEXT,
                     parent_link_id TEXT,
                     revision_id TEXT,
-                    name_hash TEXT
+                    name_hash TEXT,
+                    pinned INTEGER NOT NULL DEFAULT 0
                 );",
                 [],
             )?;
@@ -372,6 +375,12 @@ impl MetadataDB {
             }
             if !existing_columns.contains("name_hash") {
                 tx.execute("ALTER TABLE nodes ADD COLUMN name_hash TEXT", [])?;
+            }
+            if !existing_columns.contains("pinned") {
+                tx.execute(
+                    "ALTER TABLE nodes ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
             }
             hook("after_add_columns")?;
         }
@@ -541,6 +550,7 @@ impl MetadataDB {
 
     fn row_to_node(row: &rusqlite::Row) -> Result<Node, rusqlite::Error> {
         let remote_int: i32 = row.get(13)?;
+        let pinned_int: i32 = row.get(21)?;
         Ok(Node {
             path: row.get(0)?,
             parent_path: row.get(1)?,
@@ -563,6 +573,7 @@ impl MetadataDB {
             parent_link_id: row.get(18)?,
             revision_id: row.get(19)?,
             name_hash: row.get(20)?,
+            pinned: pinned_int != 0,
         })
     }
 
@@ -646,6 +657,31 @@ impl MetadataDB {
             .optional()
             .ok()
             .flatten()
+    }
+
+    pub fn set_pinned(&self, path: &str, pinned: bool) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let val = if pinned { 1 } else { 0 };
+        let rows = conn
+            .execute(
+                "UPDATE nodes SET pinned = ?1 WHERE path = ?2 COLLATE BINARY",
+                params![val, path],
+            )
+            .map_err(|e| format!("Failed updating pinned state: {}", e))?;
+        Ok(rows > 0)
+    }
+
+    pub fn list_pinned_paths(&self) -> Vec<String> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) =
+            conn.prepare("SELECT path FROM nodes WHERE pinned != 0 ORDER BY path ASC")
+        else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+            return Vec::new();
+        };
+        rows.filter_map(Result::ok).collect()
     }
 
     pub fn get_children(&self, parent_path: &str) -> Vec<Node> {
@@ -918,6 +954,182 @@ impl MetadataDB {
 
         tx.commit().map_err(|e| e.to_string())?;
         Ok((cleared, requeued))
+    }
+
+    /// Resolve a sync error / conflict node using one of:
+    /// - `"keep-local"`: re-queue the local copy for upload (`sync_status = 'modified'`).
+    /// - `"keep-remote"`: discard the local cached copy and revert to `cloud_only`.
+    /// - `"keep-both"`: save the local cached copy under a sibling `(conflict)` path and
+    ///   revert the original path to `cloud_only`.
+    pub fn resolve_error_node(
+        &self,
+        path: &str,
+        strategy: &str,
+        cache_dir: &Path,
+    ) -> Result<String, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+        let sql = format!(
+            "SELECT {} FROM nodes WHERE path = ?1 COLLATE BINARY",
+            NODE_SELECT_COLUMNS
+        );
+        let node = tx
+            .query_row(&sql, [path], Self::row_to_node)
+            .optional()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Path not found in metadata index: {}", path))?;
+
+        if node.sync_status != SyncStatus::ERROR {
+            return Err(format!(
+                "Node '{}' is not in error state (status: {})",
+                path, node.sync_status
+            ));
+        }
+
+        let msg = match strategy {
+            "keep-local" => {
+                tx.execute(
+                    "UPDATE nodes SET sync_status = ?1, last_error = NULL WHERE path = ?2 COLLATE BINARY",
+                    params![SyncStatus::MODIFIED, path],
+                )
+                .map_err(|e| e.to_string())?;
+                format!("Re-queued local copy of '{}' for upload", path)
+            }
+            "keep-remote" => {
+                if !node.remote_exists {
+                    return Err(
+                        "Cannot discard local-only file with no remote copy; use keep-local instead"
+                            .to_string(),
+                    );
+                }
+                if let Some(ref lp) = node.local_cache_path {
+                    let _ = fs::remove_file(lp);
+                }
+                tx.execute(
+                    "UPDATE nodes SET sync_status = ?1, local_cache_path = NULL, last_error = NULL
+                     WHERE path = ?2 COLLATE BINARY",
+                    params![SyncStatus::CLOUD_ONLY, path],
+                )
+                .map_err(|e| e.to_string())?;
+                format!(
+                    "Discarded local changes and reverted '{}' to cloud_only",
+                    path
+                )
+            }
+            "keep-both" => {
+                if !node.remote_exists {
+                    return Err(
+                        "Cannot split local-only file with no remote copy; use keep-local instead"
+                            .to_string(),
+                    );
+                }
+                if node.node_type != "file" {
+                    return Err("keep-both is only supported for files".to_string());
+                }
+                let src_cache = node
+                    .local_cache_path
+                    .as_deref()
+                    .filter(|p| Path::new(p).exists())
+                    .ok_or_else(|| {
+                        format!(
+                            "Cannot keep both for '{}': local cached copy is missing",
+                            path
+                        )
+                    })?;
+
+                let (stem, ext) = match node.name.rsplit_once('.') {
+                    Some((s, e)) if !s.is_empty() => (s.to_string(), Some(e.to_string())),
+                    _ => (node.name.clone(), None),
+                };
+
+                let mut attempt = 1usize;
+                let (conflict_name, conflict_path) = loop {
+                    let candidate_name = if attempt == 1 {
+                        match ext {
+                            Some(ref e) => format!("{} (conflict).{}", stem, e),
+                            None => format!("{} (conflict)", stem),
+                        }
+                    } else {
+                        match ext {
+                            Some(ref e) => format!("{} (conflict-{}).{}", stem, attempt, e),
+                            None => format!("{} (conflict-{})", stem, attempt),
+                        }
+                    };
+                    let candidate_path = if node.parent_path == "/" {
+                        format!("/{}", candidate_name)
+                    } else {
+                        format!(
+                            "{}/{}",
+                            node.parent_path.trim_end_matches('/'),
+                            candidate_name
+                        )
+                    };
+                    let exists: bool = tx
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM nodes WHERE path = ?1 COLLATE BINARY)",
+                            [&candidate_path],
+                            |row| row.get(0),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    if !exists {
+                        break (candidate_name, candidate_path);
+                    }
+                    attempt += 1;
+                };
+
+                fs::create_dir_all(cache_dir).map_err(|e| e.to_string())?;
+                let conflict_cid = generate_uuid();
+                let dst_cache = cache_dir.join(format!("{}.dat", conflict_cid));
+                fs::copy(src_cache, &dst_cache).map_err(|e| e.to_string())?;
+                #[cfg(unix)]
+                let _ = fs::set_permissions(&dst_cache, fs::Permissions::from_mode(0o600));
+                let file_size = fs::metadata(&dst_cache)
+                    .map(|m| m.len() as i64)
+                    .unwrap_or(node.size);
+                let now = now_sec();
+
+                tx.execute(
+                    "INSERT INTO nodes(path, parent_path, name, type, size, mtime, local_cache_path,
+                        sync_status, last_checked, cache_id, generation, remote_exists, last_error, pinned)
+                     VALUES(?1, ?2, ?3, 'file', ?4, ?5, ?6, ?7, ?8, ?9, 1, 0, NULL, 0)",
+                    params![
+                        conflict_path,
+                        node.parent_path,
+                        conflict_name,
+                        file_size,
+                        now,
+                        dst_cache.to_string_lossy().to_string(),
+                        SyncStatus::MODIFIED,
+                        now,
+                        conflict_cid,
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+
+                let _ = fs::remove_file(src_cache);
+                tx.execute(
+                    "UPDATE nodes SET sync_status = ?1, local_cache_path = NULL, last_error = NULL
+                     WHERE path = ?2 COLLATE BINARY",
+                    params![SyncStatus::CLOUD_ONLY, path],
+                )
+                .map_err(|e| e.to_string())?;
+
+                format!(
+                    "Saved local copy as '{}' and reverted '{}' to cloud_only",
+                    conflict_path, path
+                )
+            }
+            _ => {
+                return Err(
+                    "Unsupported resolution strategy; expected keep-local, keep-remote, or keep-both"
+                        .to_string(),
+                );
+            }
+        };
+
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(msg)
     }
 
     pub fn update_sync_status(

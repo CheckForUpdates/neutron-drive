@@ -1,0 +1,40 @@
+name: Live Mount / Interoperability Feedback
+description: Share test results from running Neutron Drive against a disposable Proton Drive test account.
+title: "[Live Test]: "
+labels: ["live-testing", "feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **Safety Reminder:** Only evaluate pre-release live FUSE mounts using a **dedicated, disposable Proton Drive test account** with non-sensitive data.
+  - type: input
+    id: scope
+    attributes:
+      label: Test scope
+      description: e.g. `native_client` ignored live tests, Dolphin/Nautilus browsing, multi-GB upload, offline/resume.
+    validations:
+      required: true
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Overall outcome
+      options:
+        - Passed without issues
+        - Passed with minor issues / workarounds
+        - Failed / data-safety or sync regression
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Distro, desktop environment, and install method
+      placeholder: "Arch Linux / KDE Plasma (Wayland) / PKGBUILD"
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Observations & details
+      description: Include transfer sizes, file manager behavior, `RateLimitGate` / retry behavior, or error messages (redacted).
+    validations:
+      required: true

@@ -1745,6 +1745,20 @@ fn handle_http_connection(
             }
             reply_json(&mut stream, 200, json!({"Code": 1000, "Responses": resps}));
         }
+        ("PUT", p) if p == format!("/drive/v2/volumes/{}/trash/restore_multiple", st.volume_id) => {
+            let req: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let ids = req["LinkIDs"].as_array().unwrap();
+            let mut resps = Vec::new();
+            for v in ids {
+                let lid = v.as_str().unwrap().to_string();
+                if let Some(link) = st.links.get_mut(&lid) {
+                    link.trashed = None;
+                    link.state = 1;
+                }
+                resps.push(json!({"LinkID": lid, "Response": {"Code": 1000}}));
+            }
+            reply_json(&mut stream, 200, json!({"Code": 1000, "Responses": resps}));
+        }
         ("POST", p)
             if p.starts_with(&format!("/drive/shares/{}/folders/", st.share_id))
                 && p.ends_with("/trash_multiple") =>
@@ -1758,6 +1772,20 @@ fn handle_http_connection(
                 if let Some(link) = st.links.get_mut(&lid) {
                     link.trashed = Some(1_700_000_500.0);
                     link.state = 2;
+                }
+                resps.push(json!({"LinkID": lid, "Response": {"Code": 1000}}));
+            }
+            reply_json(&mut stream, 200, json!({"Code": 1000, "Responses": resps}));
+        }
+        ("PUT", p) if p == format!("/drive/v2/volumes/{}/trash/restore_multiple", st.volume_id) => {
+            let req: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let ids = req["LinkIDs"].as_array().unwrap();
+            let mut resps = Vec::new();
+            for v in ids {
+                let lid = v.as_str().unwrap().to_string();
+                if let Some(link) = st.links.get_mut(&lid) {
+                    link.trashed = None;
+                    link.state = 1;
                 }
                 resps.push(json!({"LinkID": lid, "Response": {"Code": 1000}}));
             }
@@ -3580,6 +3608,52 @@ fn test_native_browser_sso_session_fork_login_and_vault_persistence() {
         std::fs::read(dl_dir.join("sso-file.txt")).unwrap(),
         b"hello-from-browser-sso"
     );
+
+    // Verify fork endpoints send cli-drive@0.9.0 while regular API calls use DEFAULT_APP_VERSION
+    let st = server.state.lock().unwrap();
+    let fork_init_headers: Vec<_> = st
+        .captured_headers
+        .iter()
+        .filter(|(_, path, _)| path == "/auth/v4/sessions/forks")
+        .collect();
+    assert!(
+        !fork_init_headers.is_empty(),
+        "Expected /auth/v4/sessions/forks request"
+    );
+    let fork_poll_headers: Vec<_> = st
+        .captured_headers
+        .iter()
+        .filter(|(_, path, _)| path.starts_with("/auth/v4/sessions/forks/"))
+        .collect();
+    assert!(
+        !fork_poll_headers.is_empty(),
+        "Expected /auth/v4/sessions/forks/{{selector}} request"
+    );
+    for (_, path, hdrs) in fork_init_headers
+        .into_iter()
+        .chain(fork_poll_headers.into_iter())
+    {
+        assert_eq!(
+            hdrs.get("x-pm-appversion").map(String::as_str),
+            Some("cli-drive@0.9.0"),
+            "Fork endpoint {} must send cli-drive@0.9.0",
+            path
+        );
+    }
+    let user_headers: Vec<_> = st
+        .captured_headers
+        .iter()
+        .filter(|(_, path, _)| path == "/core/v4/users")
+        .collect();
+    assert!(!user_headers.is_empty(), "Expected /core/v4/users request");
+    for (_, path, hdrs) in user_headers {
+        assert_eq!(
+            hdrs.get("x-pm-appversion").map(String::as_str),
+            Some(DEFAULT_APP_VERSION),
+            "Non-fork endpoint {} must keep DEFAULT_APP_VERSION",
+            path
+        );
+    }
 }
 
 #[test]
@@ -4523,4 +4597,114 @@ fn test_live_disposable_account_namespace_and_events() {
     // Trash & permanently delete test folder
     assert!(restarted.trash(&remote_root));
     assert!(restarted.delete(&remote_root));
+}
+
+#[test]
+fn test_native_atomic_cross_parent_move_and_rename_with_occupied_intermediates() {
+    let fixture = TestFixture::new();
+    let (_server, client) = new_client_and_server(&fixture, false);
+    client
+        .authenticate("alice@proton.me", "super-secret-password", None)
+        .unwrap();
+    let client = Arc::new(client);
+
+    assert!(client.create_folder("/my-files", "a"));
+    assert!(client.create_folder("/my-files", "b"));
+
+    let up_dir = fixture.root_path().join("up_atomic");
+    fs::create_dir_all(&up_dir).unwrap();
+    let old_file = up_dir.join("old");
+    let a_new_file = up_dir.join("new");
+    let b_old_file = up_dir.join("b_old");
+    fs::write(&old_file, b"moved-payload").unwrap();
+    fs::write(&a_new_file, b"a-new-blocker").unwrap();
+    fs::write(&b_old_file, b"b-old-blocker").unwrap();
+
+    assert!(client.upload_file(&old_file, "/my-files/a", "create-new-revision"));
+    assert!(client.upload_file(&a_new_file, "/my-files/a", "create-new-revision"));
+
+    let b_old_upload_dir = fixture.root_path().join("up_atomic_b");
+    fs::create_dir_all(&b_old_upload_dir).unwrap();
+    let b_old_named = b_old_upload_dir.join("old");
+    fs::write(&b_old_named, b"b-old-blocker").unwrap();
+    assert!(client.upload_file(&b_old_named, "/my-files/b", "create-new-revision"));
+
+    let client_arc: Arc<dyn RemoteDrive> = Arc::clone(&client) as Arc<dyn RemoteDrive>;
+    let fuse = ProtonDriveFUSE::new(
+        Arc::clone(&client_arc),
+        fixture.db.clone(),
+        fixture.cache_dir.clone(),
+        Some("/my-files"),
+        Arc::clone(&fixture.activity),
+    );
+    fuse.reconcile_dir("/").expect("reconcile root");
+    fuse.reconcile_dir("/a").expect("reconcile /a");
+    fuse.reconcile_dir("/b").expect("reconcile /b");
+
+    assert_eq!(fuse.rename_node("/a", "old", "/b", "new"), Ok(()));
+
+    let a_items = client.list_path("/my-files/a").unwrap();
+    let a_names: Vec<&str> = a_items.iter().map(|n| n.name.as_str()).collect();
+    assert_eq!(a_names, vec!["new"]);
+
+    let b_items = client.list_path("/my-files/b").unwrap();
+    let mut b_names: Vec<&str> = b_items.iter().map(|n| n.name.as_str()).collect();
+    b_names.sort();
+    assert_eq!(b_names, vec!["new", "old"]);
+
+    let dl_dir = fixture.root_path().join("dl_atomic");
+    fs::create_dir_all(&dl_dir).unwrap();
+    assert!(client.download_file("/my-files/b/new", &dl_dir, "overwrite"));
+    assert_eq!(fs::read(dl_dir.join("new")).unwrap(), b"moved-payload");
+
+    let dl_a_new = fixture.root_path().join("dl_a_new");
+    fs::create_dir_all(&dl_a_new).unwrap();
+    assert!(client.download_file("/my-files/a/new", &dl_a_new, "overwrite"));
+    assert_eq!(fs::read(dl_a_new.join("new")).unwrap(), b"a-new-blocker");
+
+    let dl_b_old = fixture.root_path().join("dl_b_old");
+    fs::create_dir_all(&dl_b_old).unwrap();
+    assert!(client.download_file("/my-files/b/old", &dl_b_old, "overwrite"));
+    assert_eq!(fs::read(dl_b_old.join("old")).unwrap(), b"b-old-blocker");
+}
+
+#[test]
+fn test_native_restore_from_trash_endpoint() {
+    let fixture = TestFixture::new();
+    let (server, client) = new_client_and_server(&fixture, false);
+    client
+        .authenticate("alice@proton.me", "super-secret-password", None)
+        .unwrap();
+
+    let up_dir = fixture.root_path().join("up_restore");
+    fs::create_dir_all(&up_dir).unwrap();
+    let sample = up_dir.join("recoverable.txt");
+    fs::write(&sample, b"restore-me-payload").unwrap();
+    assert!(client.upload_file(&sample, "/my-files", "create-new-revision"));
+
+    let link_id = {
+        let st = server.state.lock().unwrap();
+        st.links
+            .values()
+            .find(|l| l.link_id != st.root_link_id && l.link_type == 2)
+            .map(|l| l.link_id.clone())
+            .expect("Uploaded file link_id")
+    };
+
+    assert!(client.trash("/my-files/recoverable.txt"));
+    {
+        let st = server.state.lock().unwrap();
+        assert_eq!(st.links.get(&link_id).unwrap().state, 2);
+    }
+
+    assert!(client.restore_from_trash(&link_id));
+    {
+        let st = server.state.lock().unwrap();
+        let restored = st.links.get(&link_id).unwrap();
+        assert_eq!(restored.state, 1);
+        assert!(restored.trashed.is_none());
+    }
+
+    let items = client.list_path("/my-files").unwrap();
+    assert!(items.iter().any(|n| n.name == "recoverable.txt"));
 }

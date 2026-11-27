@@ -149,6 +149,22 @@ cargo test --manifest-path crates/proton-drive-daemon/Cargo.toml --all-targets
 
 ---
 
+## Codex on GitHub
+
+Add an OpenAI API key as the repository Actions secret `OPENAI_API_KEY`
+under **Settings → Secrets and variables → Actions**. Once the workflow is on
+the default branch, maintainers with write access can use it from GitHub.
+
+| Where | Trigger | Result |
+| --- | --- | --- |
+| Issue | Comment `/codex triage` | Triage notes and a proposed next step on the issue |
+| Pull request | Comment `/codex review` | Review findings in a PR conversation comment |
+| GitHub Actions | A failed **Release Verification Gates** push run on the default branch | Diagnosis in the **Codex GitHub Assistant** run summary |
+| GitHub Actions | Run **Codex GitHub Assistant** from the default branch and provide a failed **Release Verification Gates** run ID | Diagnosis for the selected run, including PR CI runs |
+
+Codex reads selected issue text, PR patches, or failed-step logs through the
+OpenAI API. It reports findings with read-only access to repository contents.
+
 ## Installation & Packaging
 
 ### Automated Installation Script
@@ -180,7 +196,7 @@ Generate `.deb`, `.rpm`, or `.tar.gz` packages with CPack:
 cpack --config build/CPackConfig.cmake -G DEB -B build/packages
 cpack --config build/CPackConfig.cmake -G RPM -B build/packages
 ```
-Arch Linux users can build directly using [`packaging/arch/PKGBUILD`](packaging/arch/PKGBUILD).
+Arch Linux users can build directly using [`packaging/arch/PKGBUILD`](packaging/arch/PKGBUILD). See [`docs/packaging-and-desktop.md`](docs/packaging-and-desktop.md) for Fedora COPR/RPM (`packaging/rpm/neutron-drive.spec`), Flatpak, and Dolphin/Nautilus context-menu integration.
 
 ---
 
@@ -225,7 +241,12 @@ For terminal workflows and headless servers:
 | `neutron-drive resume` | Resume background uploads |
 | `neutron-drive retry-errors` | Re-queue failed sync uploads for retry |
 | `neutron-drive clear-errors` | Safely clear stale sync error diagnostics |
-| `neutron-drive clear-cache` | Safely evict clean downloaded blocks |
+| `neutron-drive clear-cache` | Safely evict clean downloaded blocks (respecting pinned items) |
+| `neutron-drive pin <path>` | Pin a file or folder for offline access |
+| `neutron-drive unpin <path>` | Unpin a file or folder so it can be evicted from cache |
+| `neutron-drive pinned` | List files and folders pinned for offline access |
+| `neutron-drive resolve-conflict <path> [--strategy ...]` | Resolve a sync error (`keep-local`, `keep-remote`, `keep-both`) |
+| `neutron-drive restore-trash <link_id>` | Restore a trashed file or folder in Proton Drive |
 | `neutron-drive update` | Run full native build & install update (`install.sh --update`) |
 | `neutron-drive logout` | Sign out and clear stored credentials |
 

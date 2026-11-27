@@ -1018,6 +1018,16 @@ impl DriveEndpoints {
         http.post_json(RateLimitFamily::Mutation, &path, &body, true)
     }
 
+    pub fn restore_trash_links(
+        http: &PdHttpClient,
+        volume_id: &str,
+        link_ids: &[String],
+    ) -> Result<MultipleLinkResponse, HttpError> {
+        let path = format!("/drive/v2/volumes/{}/trash/restore_multiple", volume_id);
+        let body = LinkIdsBody { link_ids };
+        http.put_json(RateLimitFamily::Mutation, &path, &body, true)
+    }
+
     pub fn delete_multiple(
         http: &PdHttpClient,
         volume_id: &str,
